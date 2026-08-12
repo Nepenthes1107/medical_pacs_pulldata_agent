@@ -1,0 +1,22 @@
+[
+  {
+    "id": "hier-study-series-instance",
+    "content": "DICOM 数据三级层级：Study（一次检查，StudyInstanceUID）→ Series（一个序列，SeriesInstanceUID）→ Instance/SOP（单张图像，SOPInstanceUID）。一个 Study 含多个 Series，一个 Series 含多个 Instance。补拉可在 Study 级（拉整个检查）或 Series 级（拉单个序列）。完整性统计必须在正确层级：Study 级看所有 Series 的 SOP 总数，Series 级只看目标 Series 的 SOP 数。",
+    "metadata": {"category": "hierarchy", "stage": "general", "dicom_operation": "none", "symptom": "study,series,instance,hierarchy"}
+  },
+  {
+    "id": "hier-expected-count-source",
+    "content": "期望数量的口径来源：Study 级优先用任务 expected_image_number，否则用 study.number_of_study_related_instances（C-FIND 的 NumberOfStudyRelatedInstances）；Series 级优先用任务 expected_image_number，否则用 series.number_of_series_related_instances（NumberOfSeriesRelatedInstances）。绝不能用 Study 级总数判定 Series 级完整性。若两级期望都缺失，完整性结论为 unverified。",
+    "metadata": {"category": "hierarchy", "stage": "local_check", "dicom_operation": "c_find", "symptom": "expected count,study vs series"}
+  },
+  {
+    "id": "hier-series-level-filter",
+    "content": "Series 级完整性的关键约束：received/local/missing 统计必须只针对目标 Series。本地扫描 scan_local_dicom 传入 series_instance_uid 时只保留该 Series 的文件；query_receive_status 的 storescp 计数也按 series 过滤。禁止用整个 Study 的本地文件数判定单个 Series 是否完整——否则拉一个 Series 却用 Study 总数会误判成功。这是 spec 6.3 的硬性规则，也是回归测试的核心断言。",
+    "metadata": {"category": "hierarchy", "stage": "local_check", "dicom_operation": "none", "symptom": "series filter,not study total,completeness"}
+  },
+  {
+    "id": "hier-unique-sop-authority",
+    "content": "唯一 SOP 计数的权威来源：本地完整性一律以 local_dicom_file 表的 sop_instance_uid（唯一键）去重计数（local_unique_sop_count）。storescp_image 表以 image_name 为唯一键、不含 sop 列，只能作为“接收端是否有活动”的信号（storescp_received_count），既不等于接收事件次数也不能去重为唯一 SOP。所有 complete/incomplete 判定基于 local_unique_sop_count，绝不用 storescp 计数。Study/Series 级 missing = max(expected - local_unique_sop, 0)。",
+    "metadata": {"category": "hierarchy", "stage": "local_check", "dicom_operation": "none", "symptom": "unique sop,local authority,storescp signal"}
+  }
+]

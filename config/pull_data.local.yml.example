@@ -1,0 +1,75 @@
+app:
+  name: medical-pacs-pulldata-agent
+  log_level: INFO
+  rule_based_agent: true
+
+database:
+  url: mysql+pymysql://<DB_USER>:<DB_PASSWORD>@<DB_HOST>:3306/<DB_NAME>
+
+redis:
+  url: redis://<REDIS_HOST>:6379/0
+
+rabbitmq:
+  url: amqp://<RABBITMQ_USER>:<RABBITMQ_PASSWORD>@<RABBITMQ_HOST>:5672/%2F
+  download_queue: download_tasks
+
+storage:
+  fileserver_root: /app/data/fileserver
+
+storescp:
+  ae_title: PULLDATA_SCP
+  host: 0.0.0.0
+  port: 11112
+
+pacs_sources:
+  - id: orthanc-local
+    name: Local Orthanc
+    host: <ORTHANC_HOST>
+    port: 4242
+    ae_title: ORTHANC
+    client_ae_title: PULLDATA_SCU
+    move_destination_ae_title: PULLDATA_SCP
+    support_find_level:
+      - study_level
+      - series_level
+    support_move_level:
+      - study_level
+      - series_level
+
+checker:
+  interval_seconds: 5
+  fail_after_seconds: 120
+
+downloader:
+  max_workers: 4
+  retry_download_interval:
+    - 30
+    - 120
+    - 300
+
+# api_key 不写在这里，只用环境变量 DASHSCOPE_API_KEY 注入。
+llm:
+  model: qwen-plus
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  timeout_seconds: 60
+  max_retries: 2
+  temperature: 0.0
+
+rag:
+  persist_dir: /app/data/chroma
+  embedding_model: text-embedding-v4
+  embedding_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  enable_rerank: false
+  rerank_model: qwen3-rerank
+  top_k: 3
+
+agent:
+  agent_runs_queue: agent_runs
+  approval_lock_ttl_seconds: 300
+  max_few_shot: 3
+  checkpoint_path: /app/data/agent_checkpoints.sqlite
+
+# LANGSMITH_API_KEY 走环境变量；这里只放开关和 project 名。
+langsmith:
+  tracing_enabled: false
+  project: medical-pacs-pulldata-agent

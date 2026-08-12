@@ -1,0 +1,62 @@
+[
+  {
+    "id": "status-0000-success",
+    "content": "DIMSE 状态码 0x0000（Success）表示操作成功完成。C-ECHO 返回 0x0000 表示 PACS 可达；C-FIND 以 0x0000 结束表示查询正常结束；C-MOVE 返回 0x0000 且 failed 子操作为 0 才是真正的传输成功。注意：C-MOVE 过程中先出现的是 Pending（0xFF00/0xFF01），只有最后一个非 Pending 状态才是最终结论。切勿把 Pending 当作 0x0000 成功。",
+    "metadata": {"category": "dimse_status", "stage": "general", "dicom_operation": "c_move", "symptom": "success,final status"}
+  },
+  {
+    "id": "status-ff00-pending",
+    "content": "0xFF00 与 0xFF01（Pending）是 C-FIND/C-MOVE 过程中的中间状态。C-FIND 中每个 Pending 携带一条匹配 identifier；C-MOVE 中 Pending 报告传输进度（子操作计数）。关键规则：Pending 不是最终成功，若 C-MOVE 只收到 Pending 而没有收到最终状态（如连接中断、超时），任务不得判为 downloaded/success。本项目 pacs_client 已修正为只认最后一个非 Pending 状态。",
+    "metadata": {"category": "dimse_status", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "pending,intermediate,not final"}
+  },
+  {
+    "id": "status-b000-warning",
+    "content": "0xB000（Sub-operations Complete - One or more Failures / Warning）是 C-MOVE 的警告状态，表示传输结束但有部分子操作失败或告警。若 failed 子操作为 0，可作为可接受的完成；若 failed 大于 0，说明部分 Instance 未传输成功，应判为不完整（incomplete），需要对缺失范围补拉。诊断时要结合子操作计数而非只看状态码。",
+    "metadata": {"category": "dimse_status", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "warning,partial failure,incomplete"}
+  },
+  {
+    "id": "status-a700-outofresources",
+    "content": "0xA700（Refused: Out of Resources）表示 SCP 资源不足拒绝操作，常见于 C-MOVE/C-STORE。可能原因：PACS 或接收端内存/磁盘不足、并发连接数超限、目标 AE 队列满。表现为传输失败、本地接收数量不足。处理：降低并发、检查接收端资源、稍后重试。属于 cmove_transfer / storescp_receive 阶段的传输失败。",
+    "metadata": {"category": "dimse_status", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "out of resources,refused,resource"}
+  },
+  {
+    "id": "status-a900-datasetmismatch",
+    "content": "0xA900（Error: Data Set does not match SOP Class）表示请求 Dataset 与声明的 SOP Class 不匹配。常见于 C-FIND/C-MOVE 查询 Dataset 构造错误（如层级键与 QueryRetrieveLevel 不一致）。表现为查询/传输被拒。处理：检查查询 Dataset 的匹配键是否与 QueryRetrieveLevel 对应、SOP Class 是否正确。属于协议构造层问题。",
+    "metadata": {"category": "dimse_status", "stage": "pacs_query", "dicom_operation": "c_find", "symptom": "dataset mismatch,sop class"}
+  },
+  {
+    "id": "status-c000-cannotunderstand",
+    "content": "0xC000（Error: Cannot understand / Unable to Process）是一类通用处理错误，SCP 无法理解或处理请求。可能原因：查询/移动请求参数非法、PACS 内部错误、不支持的操作。表现为操作失败并返回该状态。处理：核对请求参数、查看 PACS 服务端日志。诊断时应记录 dicom_status_summary 供人工进一步排查。",
+    "metadata": {"category": "dimse_status", "stage": "pacs_query", "dicom_operation": "c_find", "symptom": "cannot understand,unable to process"}
+  },
+  {
+    "id": "status-a702-unabletoperform",
+    "content": "0xA702（Refused: Unable to perform sub-operations）表示 C-MOVE 无法执行子操作，通常伴随 failed 子操作计数大于 0，说明 PACS 无法把 Instance 发送到目标 AE。常见原因：Move Destination AE 配置错误、目标 storescp 不可达、目标端口被防火墙拦截。表现为任务失败或本地接收为 0。处理：核对 Move Destination 的 AE Title 与端口配置。属于 cmove_transfer / storescp_receive 阶段。",
+    "metadata": {"category": "dimse_status", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "unable to perform,move destination,failed suboperations"}
+  },
+  {
+    "id": "status-0001-echo-fail",
+    "content": "C-ECHO 场景下的非 0x0000 状态（如 Association 被拒后无法完成验证）表示 PACS 不可达。本项目 echo 工具把 Association 失败或非成功状态归为 pacs_reachable=false。此时补拉链路无法开始，故障阶段判定为 pacs_connectivity，confidence 可为 confirmed（连通性事实明确）。处理：检查 PACS 服务状态、AE Title 与端口。",
+    "metadata": {"category": "dimse_status", "stage": "pacs_connectivity", "dicom_operation": "c_echo", "symptom": "echo failed,association rejected"}
+  },
+  {
+    "id": "status-fe00-cancel",
+    "content": "0xFE00（Sub-operations terminated due to Cancel Indication）表示操作被取消。C-MOVE/C-FIND 收到 C-CANCEL 请求后返回。补拉链路一般不主动取消 DIMSE 操作，若出现该状态需检查是否有超时中断或客户端主动 release。表现为传输未完成、本地数量不足。处理：排查客户端超时设置与连接稳定性。",
+    "metadata": {"category": "dimse_status", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "cancel,terminated"}
+  },
+  {
+    "id": "status-a801-movedest-unknown",
+    "content": "0xA801（Refused: Move Destination unknown）表示 C-MOVE 指定的 Move Destination AE Title 在 PACS 侧未注册。这是 storescp 接收为 0 的典型根因：PACS 不知道该把数据发到哪里。处理：在 PACS（如 Orthanc 的 DicomModalities）中注册本项目 storescp 的 AE Title（PULLDATA_SCP）、主机与端口（11112），并确保与本端 move_destination_ae_title 配置一致。属于 storescp_receive 阶段。",
+    "metadata": {"category": "dimse_status", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "move destination unknown,not registered,receive zero"}
+  },
+  {
+    "id": "status-code-classes",
+    "content": "DIMSE 状态码按高位分类：0x0000 成功；0xFFxx（0xFF00/0xFF01）Pending 中间态；0xB000 警告（部分失败）；0xAxxx 各类拒绝/错误（资源不足 0xA700、数据不匹配 0xA900、无法执行 0xA702、目标未知 0xA801）；0xC000 通用处理失败；0xFE00 取消。诊断规则：只有 0x0000（无 failed 子操作）与 failed=0 的 0xB000 视为完成，其余一律视为未成功，Pending 视为未结束。",
+    "metadata": {"category": "dimse_status", "stage": "general", "dicom_operation": "none", "symptom": "status code classification"}
+  },
+  {
+    "id": "status-timeout-nofinal",
+    "content": "当 C-MOVE 只收到若干 Pending 却未收到任何最终状态时，通常是连接中断、网络超时或 PACS 异常退出所致。本项目判定为未成功（saw_pending 但无 final code），任务不判 downloaded。表现：move_result 中 status_code 为 Pending、无 completed 终结。处理：检查网络稳定性、PACS 与 storescp 之间链路、客户端超时配置，然后重试。属于 cmove_transfer 阶段。",
+    "metadata": {"category": "dimse_status", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "timeout,no final status,aborted"}
+  }
+]

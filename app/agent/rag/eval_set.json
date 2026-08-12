@@ -1,0 +1,62 @@
+[
+  {
+    "query": "PACS C-ECHO 失败 无法连接 补拉链路无法开始",
+    "where": null,
+    "relevant": {"categories": ["fault_sop"], "ids": ["sop-pacs-unreachable", "status-0001-echo-fail", "proto-c-echo"]}
+  },
+  {
+    "query": "C-FIND 查不到 study study_exists false UID 错误",
+    "where": null,
+    "relevant": {"ids": ["sop-study-not-found", "proto-c-find"]}
+  },
+  {
+    "query": "任务停留 in_queue worker 没有消费 队列积压 consumer 为 0",
+    "where": null,
+    "relevant": {"ids": ["sop-in-queue-stuck", "state-in-queue"]}
+  },
+  {
+    "query": "C-MOVE 之后 storescp 接收数量为 0 move destination 配置",
+    "where": null,
+    "relevant": {"ids": ["sop-storescp-zero", "ae-move-destination", "status-a801-movedest-unknown"]}
+  },
+  {
+    "query": "storescp 已经收到全部影像 但 checker 没有更新任务状态 checked_at 为空",
+    "where": null,
+    "relevant": {"ids": ["sop-checker-stuck", "comp-checker"]}
+  },
+  {
+    "query": "study 缺失一个 series 部分下载不完整 需要补拉",
+    "where": null,
+    "relevant": {"ids": ["sop-missing-series"]}
+  },
+  {
+    "query": "series 级 instance 数量不足 缺失 instance 完整性",
+    "where": null,
+    "relevant": {"ids": ["sop-series-incomplete", "hier-series-level-filter"]}
+  },
+  {
+    "query": "期望数量缺失 NumberOfStudyRelatedInstances 为空 无法判定完整性 unverified",
+    "where": null,
+    "relevant": {"ids": ["sop-unverified-no-expected", "state-unverified"]}
+  },
+  {
+    "query": "C-MOVE Pending 状态 0xFF00 是不是成功 最终状态判定",
+    "where": null,
+    "relevant": {"ids": ["status-ff00-pending", "proto-c-move", "status-timeout-nofinal"]}
+  },
+  {
+    "query": "唯一 SOP 计数 用 local_dicom_file 还是 storescp_image 权威口径",
+    "where": null,
+    "relevant": {"ids": ["hier-unique-sop-authority", "comp-local-scan"]}
+  },
+  {
+    "query": "C-MOVE 部分子操作失败 failed 大于 0 warning 0xB000",
+    "where": null,
+    "relevant": {"ids": ["status-b000-warning", "proto-dimse-suboperations"]}
+  },
+  {
+    "query": "AE Title 配置 calling called move destination 双向",
+    "where": null,
+    "relevant": {"categories": ["ae_config"]}
+  }
+]

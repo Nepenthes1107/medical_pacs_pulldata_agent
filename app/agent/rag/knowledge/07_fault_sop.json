@@ -1,0 +1,47 @@
+[
+  {
+    "id": "sop-pacs-unreachable",
+    "content": "故障 SOP - PACS 不可达。现象：C-ECHO 失败，pacs_reachable=false，补拉链路无法开始。所需证据：query_pacs_target 的 C-ECHO 结果与 dicom_status_summary、query_receive_status 本地为 0。可能原因：PACS 服务未启动或网络不通、AE Title 配置错误（PULLDATA_SCU ↔ ORTHANC 不匹配）、PACS 端口 4242 不可达。处理动作：检查 PACS 服务运行状态、核对本端与 PACS 的 AE Title 配置、确认端口连通。故障阶段 pacs_connectivity，confidence 通常 confirmed，不建议重试。",
+    "metadata": {"category": "fault_sop", "stage": "pacs_connectivity", "dicom_operation": "c_echo", "symptom": "pacs unreachable,c-echo failed,ae title"}
+  },
+  {
+    "id": "sop-study-not-found",
+    "content": "故障 SOP - Study 不存在。现象：PACS 可达但 C-FIND 未查到目标 Study，study_exists=false。所需证据：query_pacs_target（C-ECHO ok、C-FIND 0 条）、query_task_context 无匹配任务。可能原因：StudyInstanceUID 输入错误、该 Study 已从 PACS 删除、查询权限不足。处理动作：核对 StudyInstanceUID、在 Orthanc Web UI 搜索该 Study 确认存在性。故障阶段 pacs_query，confidence confirmed，不建议重试。",
+    "metadata": {"category": "fault_sop", "stage": "pacs_query", "dicom_operation": "c_find", "symptom": "study not found,zero records,wrong uid"}
+  },
+  {
+    "id": "sop-series-not-found",
+    "content": "故障 SOP - Series 不存在或归属冲突。现象：Study 存在但目标 Series C-FIND 未找到，series_exists=false，任务 level=series_level 且 status=fail。所需证据：query_task_context（series_uid、last_error='Series not found in PACS'）、query_pacs_target（study_exists=true、series_exists=false）。可能原因：SeriesInstanceUID 不存在于 PACS、该 Series 已删除或从未上传。处理动作：在 PACS 确认 Study 下 Series 列表；若确不存在则取消任务并通知上游。故障阶段 pacs_query，不建议重试。",
+    "metadata": {"category": "fault_sop", "stage": "pacs_query", "dicom_operation": "c_find", "symptom": "series not found,ownership conflict"}
+  },
+  {
+    "id": "sop-in-queue-stuck",
+    "content": "故障 SOP - 任务停留 in_queue。现象：任务创建后长期 in_queue，download_started_at 为 null。所需证据：query_task_context（status=in_queue、created_at 久远）、query_worker_health（message_count>0、consumer_count=0、backlog_likely=true）。可能原因：pull-data-worker 未运行或崩溃、RabbitMQ consumer 注册失败。处理动作：检查下载 Worker 运行状态与消费者注册日志。故障阶段 task_queue，不建议重试（重试无 Worker 消费仍会卡）。",
+    "metadata": {"category": "fault_sop", "stage": "task_queue", "dicom_operation": "none", "symptom": "in_queue,worker down,no consumer,backlog"}
+  },
+  {
+    "id": "sop-storescp-zero",
+    "content": "故障 SOP - C-MOVE 后 storescp 接收为 0。现象：任务 downloaded（C-MOVE 已执行）但 storescp_received_count=0、local_unique_sop=0，数据传输阶段完全丢失。所需证据：query_task_context（status=downloaded、move_finished_at 有值）、query_receive_status（接收全 0）、integrity（expected>0、missing=expected、incomplete）。可能原因：Move Destination AE Title 配置错误（非 PULLDATA_SCP）、storescp 端口 11112 不可达或被防火墙拦截、C-MOVE 返回成功但实际未发送。处理动作：核对 Move Destination AE 与端口、检查 storescp 运行与接收日志。故障阶段 storescp_receive，建议重试并需审批。",
+    "metadata": {"category": "fault_sop", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "storescp zero,move destination,port"}
+  },
+  {
+    "id": "sop-checker-stuck",
+    "content": "故障 SOP - storescp 已收图但 Checker 未更新状态。现象：storescp_received_count 与 local_unique_sop 均达期望、integrity=complete，但任务仍 downloaded、checked_at=null。所需证据：query_receive_status（接收完整）、integrity（complete）、query_task_context（status=downloaded、checked_at=null）。可能原因：pull-data-checker 未运行或崩溃、Checker 查询条件与写入记录不一致、fail_after_seconds 超时过早。处理动作：检查 Checker 运行状态与日志确认扫描周期。故障阶段 local_check，不建议重试（数据已完整，问题在校验环节）。",
+    "metadata": {"category": "fault_sop", "stage": "local_check", "dicom_operation": "none", "symptom": "checker stuck,complete but not success,checked_at null"}
+  },
+  {
+    "id": "sop-missing-series",
+    "content": "故障 SOP - Study 部分 Series 缺失。现象：Study 级任务 downloaded，本地唯一 SOP 少于期望，缺失整个 Series。所需证据：query_pacs_target（expected=Study 总数）、query_receive_status（local_unique_sop 少于期望、series_distribution 显示部分 Series）、integrity（incomplete、missing_series 列出缺失 UID）。可能原因：C-MOVE Study 级拉取时 PACS 漏传某 Series、该 Series 传输失败。处理动作：对缺失的 Series 创建 Series 级补拉任务。故障阶段 cmove_transfer，建议重试并需审批。",
+    "metadata": {"category": "fault_sop", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "missing series,partial study,incomplete"}
+  },
+  {
+    "id": "sop-series-incomplete",
+    "content": "故障 SOP - Series Instance 数量不完整。现象：Series 级任务，目标 Series 期望 N 但实际接收少于 N，缺失若干 Instance。所需证据：query_pacs_target（series_exists=true、parent_study_uid、expected=Series 数量）、query_receive_status（仅统计目标 Series 的 local_unique_sop）、integrity（level=series、missing_instance_count>0、incomplete）。可能原因：C-MOVE 传输中部分 Instance 丢失（网络中断/PACS 发送失败）、PACS 侧该 Series 实际数量不足。处理动作：对目标 Series 发起受控重试。故障阶段 cmove_transfer，建议重试并需审批。",
+    "metadata": {"category": "fault_sop", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "series incomplete,missing instances,partial"}
+  },
+  {
+    "id": "sop-unverified-no-expected",
+    "content": "故障 SOP - 期望数量缺失导致 unverified。现象：PACS 返回了 Study 但未提供期望 Instance 数量（NumberOfStudyRelatedInstances 为空），无法判定完整性。所需证据：query_pacs_target（study_exists=true、expected_instance_count=null）、query_receive_status（本地已接收若干）、integrity（expected=null、result=unverified）。可能原因：PACS 侧 DICOM 缺 NumberOfStudyRelatedInstances 标签、数据源不提供期望数量。处理动作：手动查询 PACS 中 Study 的 Series 组成、逐 Series 创建诊断以获取 per-series 期望。故障阶段 unknown，confidence uncertain，不建议盲目重试。",
+    "metadata": {"category": "fault_sop", "stage": "unknown", "dicom_operation": "c_find", "symptom": "unverified,expected missing,no basis"}
+  }
+]

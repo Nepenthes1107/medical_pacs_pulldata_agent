@@ -1,0 +1,11 @@
+{
+  "Name": "Local Orthanc",
+  "DicomAet": "ORTHANC",
+  "DicomPort": 4242,
+  "RemoteAccessAllowed": true,
+  "AuthenticationEnabled": false,
+  "DicomModalities": {
+    "PULLDATA_SCP": ["PULLDATA_SCP", "pull-data-storescp", 11112],
+    "PULLDATA_SCU": ["PULLDATA_SCU", "pull-data-api", 104]
+  }
+}

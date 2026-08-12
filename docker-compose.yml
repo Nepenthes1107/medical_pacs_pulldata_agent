@@ -1,0 +1,150 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: pulldata-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: pulldata
+      MYSQL_USER: uii
+      MYSQL_PASSWORD: "011107"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./config/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  orthanc:
+    image: orthancteam/orthanc
+    ports:
+      - "8042:8042"
+      - "4242:4242"
+    volumes:
+      - ./config/orthanc.json:/etc/orthanc/orthanc.json:ro
+      - orthanc_data:/var/lib/orthanc/db
+
+  pull-data-api:
+    build: .
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      FILESERVER_ROOT: /app/data/fileserver
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-medical-pacs-pulldata-agent}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/fileserver:/app/data/fileserver
+      - ./config:/app/config:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+
+  pull-data-storescp:
+    build: .
+    command: python -m app.dicom.storescp
+    environment:
+      DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      FILESERVER_ROOT: /app/data/fileserver
+    ports:
+      - "11112:11112"
+    volumes:
+      - ./data/fileserver:/app/data/fileserver
+      - ./config:/app/config:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  pull-data-worker:
+    build: .
+    command: python -m app.workers.downloader_worker
+    environment:
+      DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      FILESERVER_ROOT: /app/data/fileserver
+    volumes:
+      - ./data/fileserver:/app/data/fileserver
+      - ./config:/app/config:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_started
+      pull-data-storescp:
+        condition: service_started
+
+  pull-data-checker:
+    build: .
+    command: python -m app.workers.checker_worker
+    environment:
+      DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      FILESERVER_ROOT: /app/data/fileserver
+    volumes:
+      - ./data/fileserver:/app/data/fileserver
+      - ./config:/app/config:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  agent-worker:
+    build: .
+    command: python -m app.workers.agent_worker
+    environment:
+      DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
+      REDIS_URL: redis://redis:6379/0
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      FILESERVER_ROOT: /app/data/fileserver
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen-plus}
+      LANGSMITH_TRACING: ${LANGSMITH_TRACING:-false}
+      LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-medical-pacs-pulldata-agent}
+    volumes:
+      - ./data/fileserver:/app/data/fileserver
+      - ./data/chroma:/app/data/chroma
+      - ./config:/app/config:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+
+volumes:
+  mysql_data:
+  rabbitmq_data:
+  orthanc_data:

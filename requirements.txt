@@ -1,0 +1,26 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy
+PyMySQL
+pydantic
+pydantic-settings
+PyYAML
+redis
+pika
+pydicom
+pynetdicom
+requests
+langgraph
+langchain-core
+langchain-openai
+langsmith
+langgraph-checkpoint-sqlite
+langchain-text-splitters
+chromadb
+python-dotenv
+
+# --- 可选：MCP 薄层（阶段 11，只暴露 4 个只读工具）---
+mcp
+
+# --- dev / test ---
+pytest

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "proto-c-echo",
+    "content": "C-ECHO（Verification SOP Class）用于验证两个 DICOM 应用实体之间的连通性，相当于 DICOM 层的 ping。请求方（SCU）向对端（SCP）发起 Association 建立请求，携带 Verification 表示上下文；对端接受后返回 C-ECHO-RSP，状态码 0x0000 表示成功。常见问题：Association 被拒（AE Title 不匹配、对端未配置本端为已知节点）、端口不可达、传输语法协商失败。在补拉链路中，C-ECHO 是诊断 PACS 连通性的第一步，失败则整条链路无法开始，故障阶段判定为 pacs_connectivity。",
+    "metadata": {"category": "dicom_protocol", "stage": "pacs_connectivity", "dicom_operation": "c_echo", "symptom": "association rejected,unreachable,ae title"}
+  },
+  {
+    "id": "proto-c-find",
+    "content": "C-FIND 用于在 PACS 中按查询条件检索 Study/Series/Instance 元数据。SCU 构造查询 Dataset（指定 QueryRetrieveLevel 与匹配键，如 StudyInstanceUID），SCP 逐条返回匹配记录，每条以 Pending 状态（0xFF00/0xFF01）携带 identifier，最后以 0x0000 结束。补拉链路用 C-FIND 获取期望数量 NumberOfStudyRelatedInstances / NumberOfSeriesRelatedInstances。常见问题：返回 0 条（UID 错误或数据不存在，故障阶段 pacs_query）、期望数量标签为空（导致完整性 unverified）、查询权限不足。",
+    "metadata": {"category": "dicom_protocol", "stage": "pacs_query", "dicom_operation": "c_find", "symptom": "study not found,zero records,expected count"}
+  },
+  {
+    "id": "proto-c-move",
+    "content": "C-MOVE 请求 PACS 把匹配的影像通过 C-STORE 发送到指定的 Move Destination AE。SCU 发起 C-MOVE-RQ，PACS 作为 SCU 反向向目标 AE（本项目的 storescp）发起 C-STORE。传输过程中 PACS 周期性回 Pending（0xFF00/0xFF01）报告进度，最终回一个非 Pending 状态。关键：Pending 是中间态，绝不能判为最终成功；最终成功以 0x0000 且 failed 子操作为 0 为准。Move Destination 配置错误会导致 PACS 无处发送、storescp 收不到数据（storescp_receive 阶段）。",
+    "metadata": {"category": "dicom_protocol", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "pending,move destination,partial failure"}
+  },
+  {
+    "id": "proto-c-store",
+    "content": "C-STORE 用于把单个 DICOM Instance 从 SCU 推送到 SCP 存储。在补拉链路中，PACS 执行 C-MOVE 时作为 SCU，向本项目 storescp（SCP）逐个 C-STORE 发送 Instance。storescp 接收后保存文件到 fileserver 并登记 storescp_image。常见问题：storescp 端口（默认 11112）不可达、传输语法不支持、磁盘写入失败。C-STORE 全部失败会表现为 storescp 接收数为 0（storescp_receive 阶段），部分失败表现为本地数量少于期望（cmove_transfer 阶段漏传）。",
+    "metadata": {"category": "dicom_protocol", "stage": "storescp_receive", "dicom_operation": "c_store", "symptom": "receive zero,port unreachable,save failed"}
+  },
+  {
+    "id": "proto-association",
+    "content": "DICOM Association 是所有 DIMSE 操作的前提。SCU 发起 A-ASSOCIATE-RQ，携带 Calling AE Title、Called AE Title 与若干 Presentation Context（SOP Class + Transfer Syntax）。SCP 校验 AE Title 白名单并逐个接受/拒绝 Presentation Context。若 Called/Calling AE Title 与对端配置不符，Association 被拒（A-ASSOCIATE-RJ），所有后续操作无法进行。补拉链路中 PULLDATA_SCU 连 ORTHANC、PACS 反连 PULLDATA_SCP，两个方向的 AE Title 都必须双向配置正确。",
+    "metadata": {"category": "dicom_protocol", "stage": "pacs_connectivity", "dicom_operation": "c_echo", "symptom": "associate reject,ae title mismatch"}
+  },
+  {
+    "id": "proto-qr-model",
+    "content": "Query/Retrieve Information Model 决定 C-FIND/C-MOVE 的层级根。本项目使用 Study Root（StudyRootQueryRetrieveInformationModelFind/Move）。QueryRetrieveLevel 可为 STUDY / SERIES / IMAGE。Study 级 C-MOVE 拉取整个 Study 下所有 Series；Series 级 C-MOVE 只拉取指定 SeriesInstanceUID。层级选择影响期望数量口径：Study 级用 NumberOfStudyRelatedInstances，Series 级用 NumberOfSeriesRelatedInstances，二者不可混用。",
+    "metadata": {"category": "dicom_protocol", "stage": "general", "dicom_operation": "c_find", "symptom": "query retrieve level,study root"}
+  },
+  {
+    "id": "proto-transfer-syntax",
+    "content": "Transfer Syntax 定义 DICOM 数据的编码方式（字节序、是否压缩）。常见有 Implicit VR Little Endian（1.2.840.10008.1.2）、Explicit VR Little Endian、以及 JPEG/JPEG2000 等压缩语法。Association 协商阶段 SCU 与 SCP 必须就每个 Presentation Context 协商出共同支持的传输语法，否则该上下文被拒。C-MOVE/C-STORE 时若 storescp 不支持 PACS 发送的压缩语法，会导致接收失败。排查接收异常时可关注传输语法协商结果。",
+    "metadata": {"category": "dicom_protocol", "stage": "storescp_receive", "dicom_operation": "c_store", "symptom": "transfer syntax,negotiation failed"}
+  },
+  {
+    "id": "proto-dimse-suboperations",
+    "content": "C-MOVE 响应中包含四个子操作计数：NumberOfRemainingSuboperations（剩余）、NumberOfCompletedSuboperations（成功）、NumberOfFailedSuboperations（失败）、NumberOfWarningSuboperations（警告）。这些计数反映 PACS 向目标 AE 逐个 C-STORE 的进度。最终状态判定必须结合这些计数：即使最终状态码为 0x0000，若 failed 子操作大于 0，也说明部分 Instance 未成功传输，应判为不完整而非成功。这是完整性判定的重要 PACS 侧依据。",
+    "metadata": {"category": "dicom_protocol", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "suboperations,failed count,partial"}
+  }
+]

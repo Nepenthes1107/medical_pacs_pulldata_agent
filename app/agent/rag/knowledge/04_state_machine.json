@@ -1,0 +1,47 @@
+[
+  {
+    "id": "state-in-queue",
+    "content": "in_queue 是任务创建后的初始状态：download_task 已写库、消息已投递 RabbitMQ download_tasks 队列，等待 Worker 消费。写 queued_at。若长时间停留 in_queue（download_started_at 仍为 null），说明 Worker 未消费——可能 pull-data-worker 未运行或 RabbitMQ consumer_count=0。这是 Case 4 的场景，故障阶段 task_queue。排查：查队列 message_count/consumer_count、Worker 进程状态。",
+    "metadata": {"category": "state_machine", "stage": "task_queue", "dicom_operation": "none", "symptom": "in_queue,stuck,worker not consuming"}
+  },
+  {
+    "id": "state-downloading",
+    "content": "downloading 表示 Worker 已消费任务、正在执行 C-MOVE。进入该状态前 Worker 用短事务提交 downloading 与 download_started_at，使状态在耗时的 C-MOVE 期间对外可见（修复了原长事务导致的不可观测问题）。若任务长期停留 downloading（move_finished_at 仍 null），说明 C-MOVE 阻塞或 Worker 异常退出。故障阶段 cmove_transfer。排查：Worker 日志、PACS C-MOVE 响应、storescp 端口。",
+    "metadata": {"category": "state_machine", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "downloading,blocked,cmove hang"}
+  },
+  {
+    "id": "state-downloaded",
+    "content": "downloaded 表示 C-MOVE 已返回最终成功状态（0x0000 无 failed，或 failed=0 的 0xB000），写 move_finished_at。此时数据应已由 storescp 接收，等待 Checker 校验完整性。downloaded 只代表 C-MOVE 请求完成，不代表数据完整——完整性由 Checker 比对期望数量与本地唯一 SOP 数决定。若 downloaded 长期未转 success（checked_at 为 null），可能 Checker 未运行（Case 6，local_check 阶段）。",
+    "metadata": {"category": "state_machine", "stage": "local_check", "dicom_operation": "none", "symptom": "downloaded,awaiting check"}
+  },
+  {
+    "id": "state-success",
+    "content": "success 是终态：Checker 校验本地唯一 SOP 数 ≥ 期望数量，判定完整。写 checked_at，archive.status=finished。这是链路正常完成的标志（fault_stage=complete）。Checker 是完整性唯一裁判，success 由它独家裁定，不发任何消息、不需要 Agent 再证一遍；若该任务关联 awaiting_repull 的 agent_run，Checker 在同一事务内把该 Run 置 completed 并写入验收结论。到达 success 后无需重试。诊断遇到 success 状态应确认无需干预，可保留任务记录作为验收证据。",
+    "metadata": {"category": "state_machine", "stage": "complete", "dicom_operation": "none", "symptom": "success,complete,finished"}
+  },
+  {
+    "id": "state-fail",
+    "content": "fail 是失败终态，写 failed_at 与 last_error。触发场景：C-MOVE 返回非成功状态、C-MOVE 抛异常、Checker 判定不完整且超时（本地数量持续少于期望超过 fail_after_seconds）。fail 任务 can_retry=true，可经人工审批后重试。诊断时结合 last_error 与本地数量判断根因（队列/传输/接收）。RabbitMQ 投递失败也会置 fail。",
+    "metadata": {"category": "state_machine", "stage": "general", "dicom_operation": "none", "symptom": "fail,failed,last_error,retry"}
+  },
+  {
+    "id": "state-cancel",
+    "content": "cancel 是用户主动取消的终态。Worker 在 _begin_downloading 与 _finish_move 都会检查 cancel 并跳过，不覆盖终态、不执行 C-MOVE。archive.status 置 fail、last_error 记 task canceled。诊断遇到 cancel 不建议自动重试；如需重新补拉应新建任务或显式 force retry。",
+    "metadata": {"category": "state_machine", "stage": "general", "dicom_operation": "none", "symptom": "cancel,canceled"}
+  },
+  {
+    "id": "state-unverified",
+    "content": "unverified 是 download_task 的独立终结状态，含义是「链路通但完整性无法严格核对」：期望数量缺失（PACS 未返回 NumberOfStudyRelatedInstances 且任务无 expected_image_number）时 Checker 判定 unverified，同时写 checked_at 使其终结，不再重复扫描。它与 downloaded 必须区分：downloaded 表示 C-MOVE 已完成、正在等数据补齐（checked_at 为 NULL，Checker 每轮继续扫）；unverified 表示已校验过、结论是无法判断（checked_at 非 NULL）。不要把 unverified 当成 success，也不要据此自动补拉。关联的 awaiting_repull agent_run 同事务置 completed、结论记 unverified，不发失败事件、不写经验。can_retry 为 false（只有 fail 可直接重试），需人工确认 PACS 缓存或任务元数据后再决定。诊断上 result=unverified、fault_stage=unknown、confidence=uncertain（Case 9）。",
+    "metadata": {"category": "state_machine", "stage": "local_check", "dicom_operation": "none", "symptom": "unverified,expected missing,cannot verify"}
+  },
+  {
+    "id": "state-agent-run-awaiting-repull",
+    "content": "awaiting_repull 是 agent_run（不是 download_task）的状态：人工审批通过、补拉任务已投递，等补拉结果。离开该状态只有四条路径，且完整性判定权只在 Checker 一处：(1) Checker 判 success → 同事务置 completed，结论 integrity_result=complete，不发消息，事务提交后结束 SSE 并在原诊断 confidence=confirmed 时写经验；(2) Checker 判 unverified → 同事务置 completed，结论 unverified，不写经验；(3) 失败事件（Downloader C-MOVE 失败 failure_stage=move，或 Checker 超时仍不完整 failure_stage=integrity）→ Agent Worker 重新运行正常诊断图产出新提议，新提议仍须人工审批，禁止自动执行；(4) 事件丢失超时兜底（repull_terminal_timeout_seconds 默认 1800 秒）→ completed 并注明需人工核查，不伪装成成功。人工取消/紧急止损让 Run 离开 awaiting_repull 后就不再被失败事件唤醒。Agent 不重复证明完整性——两个裁判对同一套事实分叉时无法仲裁。",
+    "metadata": {"category": "state_machine", "stage": "general", "dicom_operation": "none", "symptom": "awaiting_repull,agent run state,checker sole arbiter,repull failure event"}
+  },
+  {
+    "id": "state-transitions",
+    "content": "合法状态转换：in_queue → downloading（Worker 消费）→ downloaded（C-MOVE 成功）→ success（Checker 校验完整）/ fail（不完整且超时）/ unverified（期望数缺失,无法核对）。任意状态可 → cancel（用户取消）。fail → in_queue（重试，重置阶段时间）。注意 C-MOVE 失败或断开直接落 fail、不经过 downloaded，所以停留在 downloaded 等待补齐的任务其 C-MOVE 必然已成功返回，等的是 PACS 反向 C-STORE 推流的尾部延迟。Checker 只处理 status=downloaded 且 checked_at IS NULL 的任务，达到 success/fail/unverified 终结态后写 checked_at 不再重复扫描。阶段时间字段（queued_at/download_started_at/move_finished_at/checked_at/failed_at）支撑各阶段的可观测性与超时判定。",
+    "metadata": {"category": "state_machine", "stage": "general", "dicom_operation": "none", "symptom": "state transition,lifecycle,stage timestamps"}
+  }
+]

@@ -1,0 +1,37 @@
+[
+  {
+    "id": "comp-storescp",
+    "content": "storescp 是 DICOM C-STORE SCP，监听 11112 接收 PACS C-MOVE 回传的 Instance。职责：保存 DICOM 文件到 fileserver、按 SOP upsert 登记 storescp_image、写 Redis 事件。输入：PACS 的 C-STORE。输出：本地文件 + storescp_image 记录。失败模式：端口不可达（接收 0）、磁盘写失败、重复接收（image_name 唯一键需 upsert 避免冲突）。storescp_image 只作接收活动信号，不作完整性权威计数。",
+    "metadata": {"category": "component_boundary", "stage": "storescp_receive", "dicom_operation": "c_store", "symptom": "storescp,receive,save file"}
+  },
+  {
+    "id": "comp-local-scan",
+    "content": "本地扫描 scan_local_dicom 遍历 fileserver 下目标 Study（或 Series）目录，解析每个 DICOM 文件的 StudyInstanceUID/SeriesInstanceUID/SOPInstanceUID 等，按唯一 SOP 去重统计。输入：study_instance_uid（可选 series_instance_uid 做过滤）。输出：total_sop_count（唯一 SOP 数，权威完整性口径）、series 分布、instances 明细。是完整性判定的实际数量来源，供 Checker 和 query_receive_status 复用。",
+    "metadata": {"category": "component_boundary", "stage": "local_check", "dicom_operation": "none", "symptom": "local scan,unique sop,filter"}
+  },
+  {
+    "id": "comp-checker",
+    "content": "Checker（checker_worker）是完整性的唯一裁判。周期扫描 status=downloaded 且 checked_at IS NULL 的任务，比对期望数量与本地唯一 SOP 数：达标→success；缺失且超时→fail；期望缺失→unverified（独立终结状态）；未超时未达标→保持 downloaded 等待下轮。更新 archive、写 checked_at 终结。补拉场景下还负责收尾关联的 agent_run：success/unverified 在同一事务内把 awaiting_repull 的 Run 直接置 completed 并写入验收结论，不发任何消息；只有超时仍不完整才发布 failure_stage=integrity 失败事件。事务提交后才做外部副作用（结束 SSE、best-effort 写经验）。失败模式：Checker 未运行导致 downloaded 长期不转 success（Case 6）、超时过早触发误判 fail。超时基准用 move_finished_at。",
+    "metadata": {"category": "component_boundary", "stage": "local_check", "dicom_operation": "none", "symptom": "checker,verify,not running"}
+  },
+  {
+    "id": "comp-downloader",
+    "content": "Downloader（downloader_worker）消费 RabbitMQ download_tasks 队列，执行 C-MOVE。改造后拆成两段短事务：_begin_downloading 提交 downloading + download_started_at（状态可观测）→ 在会话外执行耗时 C-MOVE → _finish_move 写最终状态 + move_finished_at/failed_at。C-MOVE 失败时（且非人工止损/取消）发布 failure_stage=move 的补拉失败事件；C-MOVE 成功不发消息，完整性交 Checker 裁定。输入：队列消息（task_id）。输出：download_task 状态流转 + move_result。失败模式：Worker 未运行（任务卡 in_queue）、C-MOVE 阻塞（卡 downloading）。",
+    "metadata": {"category": "component_boundary", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "downloader,worker,cmove"}
+  },
+  {
+    "id": "comp-pacs-client",
+    "content": "PacsClient 封装 pynetdicom，提供 echo（C-ECHO 连通性）、find_study/find_series（C-FIND 元数据）、move_study/move_series（C-MOVE 补拉）。C-MOVE 最终状态判定已修正：只认最后一个非 Pending 状态，0x0000 且 failed=0 或 failed=0 的 0xB000 才算成功，纯 Pending 不算。输入：source_id + UID。输出：结构化结果（ok/status_code/子操作计数）。是所有 PACS 交互的唯一入口。",
+    "metadata": {"category": "component_boundary", "stage": "general", "dicom_operation": "c_move", "symptom": "pacs client,pynetdicom,move judgment"}
+  },
+  {
+    "id": "comp-agent-worker",
+    "content": "Agent Worker（agent_worker）消费两个队列。agent_runs：跑自主诊断循环图（reason↔act↔observe→diagnose），产出结构化根因与补拉计划，落 agent_run 表。repull_events：只消费补拉失败事件（failure_stage=move 或 integrity），找到该 task 的 awaiting_repull Run 后重新运行正常诊断图（复用同一 run_id/thread），产出新的补拉提议。关键边界：Agent 不判定完整性——那是 Checker 的唯一职责，Agent 只对已确认失败的任务做根因诊断；Agent 也绝不自动执行补拉，任何写操作必经人工审批闸门。success/unverified 不会进入 Agent（Checker 已同事务收尾）。事件丢失有 awaiting_repull 超时兜底，只释放卡住的 thread，不伪装成成功、不写经验。",
+    "metadata": {"category": "component_boundary", "stage": "general", "dicom_operation": "none", "symptom": "agent worker,diagnosis,repull failure event,approval"}
+  },
+  {
+    "id": "comp-boundary-summary",
+    "content": "组件职责边界串起补拉链路：routes_task 创建任务（C-FIND 写 study/series）→ RabbitMQ 投递 → Downloader C-MOVE → PACS 反向 C-STORE → storescp 接收保存 → 本地文件 → Checker 扫描比对裁定完整性 → 更新任务终态；只有失败才发事件进 Agent 重新诊断。诊断时按故障阶段定位到具体组件：pacs_connectivity/pacs_query→PacsClient/PACS；task_queue→RabbitMQ/Downloader；cmove_transfer→Downloader/PACS；storescp_receive→storescp/AE 配置；local_check→Checker。每个组件都有明确输入输出与失败模式，完整性口径只有一处（Checker），避免两个裁判对同一套事实给出分叉结论。",
+    "metadata": {"category": "component_boundary", "stage": "general", "dicom_operation": "none", "symptom": "boundary,pipeline,fault localization"}
+  }
+]

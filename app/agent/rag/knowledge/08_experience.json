@@ -1,0 +1,17 @@
+[
+  {
+    "id": "exp-seed-1",
+    "content": "经验记忆（人工确认）。现象：某 Study 级任务 downloaded 后 storescp 接收为 0，多次出现在新部署环境。证据：C-ECHO ok、C-FIND 有期望数量、query_receive_status 全 0、integrity incomplete missing=全部。根因：Orthanc DicomModalities 未把 PULLDATA_SCP 映射到 storescp 容器主机名，C-MOVE 无处投递。动作：在 orthanc.json 补 DicomModalities 条目（PULLDATA_SCP → storescp 服务名:11112）后重试补拉，接收恢复正常。经验：新环境首拉前先验证 Move Destination 注册。",
+    "metadata": {"category": "experience", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "storescp zero,new environment,move destination", "source": "experience", "run_id": "seed-1"}
+  },
+  {
+    "id": "exp-seed-2",
+    "content": "经验记忆（人工确认）。现象：任务长期停留 in_queue，队列积压。证据：query_worker_health message_count>0 且 consumer_count=0，Worker 容器日志显示启动后未注册消费者。根因：pull-data-worker 容器因 RabbitMQ 连接串错误崩溃重启，未成功注册 consumer。动作：修正 RABBITMQ_URL 后重启 Worker，consumer_count 恢复为 1，积压任务被消费。经验：in_queue 卡住优先看 consumer_count 而非重试任务本身。",
+    "metadata": {"category": "experience", "stage": "task_queue", "dicom_operation": "none", "symptom": "in_queue,consumer zero,worker crash", "source": "experience", "run_id": "seed-2"}
+  },
+  {
+    "id": "exp-seed-3",
+    "content": "经验记忆（人工确认）。现象：Study 级补拉后本地数量少于期望，缺失一个 Series。证据：integrity incomplete、missing_series 列出一个 UID、其余 Series 完整。根因：该 Series 在 PACS 存在但 C-MOVE Study 级拉取时因单序列传输超时被漏传。动作：对缺失 Series 创建 Series 级补拉任务，单独重试后补齐，整 Study 达到 complete。经验：Study 级漏传单个 Series 时，Series 级定向补拉比整 Study 重拉更高效。",
+    "metadata": {"category": "experience", "stage": "cmove_transfer", "dicom_operation": "c_move", "symptom": "missing series,series-level retry,partial", "source": "experience", "run_id": "seed-3"}
+  }
+]

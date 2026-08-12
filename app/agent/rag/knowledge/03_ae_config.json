@@ -1,0 +1,27 @@
+[
+  {
+    "id": "ae-title-basics",
+    "content": "AE Title（Application Entity Title）是 DICOM 节点的逻辑标识，最长 16 字符。每次 Association 都要声明 Calling AE Title（发起方）与 Called AE Title（接收方）。补拉链路涉及三个 AE：本端 SCU（PULLDATA_SCU，发起 C-ECHO/C-FIND/C-MOVE）、PACS（如 ORTHANC）、本端 SCP（PULLDATA_SCP，接收 C-STORE）。任一 AE Title 配置错误都会导致 Association 被拒或 C-MOVE 无法投递。这是 pacs_connectivity 与 storescp_receive 两个阶段的常见根因。",
+    "metadata": {"category": "ae_config", "stage": "pacs_connectivity", "dicom_operation": "c_echo", "symptom": "ae title,calling,called"}
+  },
+  {
+    "id": "ae-move-destination",
+    "content": "Move Destination 是 C-MOVE 的关键配置：告诉 PACS 把影像通过 C-STORE 发送到哪个 AE。本项目 move_destination_ae_title 默认 PULLDATA_SCP。PACS 侧必须把该 AE Title 映射到 storescp 的实际主机与端口（Orthanc 的 DicomModalities）。若 Move Destination 在 PACS 未注册或映射错误，C-MOVE 会返回 0xA801（Move Destination unknown）或数据无处可发，表现为 storescp 接收数为 0。这是 Case 5（storescp 接收 0）的首要排查项。",
+    "metadata": {"category": "ae_config", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "move destination,storescp zero,not registered"}
+  },
+  {
+    "id": "ae-port-config",
+    "content": "端口配置：storescp 默认监听 11112 接收 C-STORE；PACS（Orthanc）DICOM 端口默认 4242；Orthanc Web/REST 默认 8042。C-MOVE 要求 PACS 能主动连到 storescp 的 11112 端口。常见问题：11112 被防火墙拦截、容器端口未映射、storescp 未启动。表现为 storescp 接收为 0 或连接超时。排查：确认 storescp 进程在运行、端口可从 PACS 侧访问。属于 storescp_receive 阶段。",
+    "metadata": {"category": "ae_config", "stage": "storescp_receive", "dicom_operation": "c_store", "symptom": "port,11112,firewall,unreachable"}
+  },
+  {
+    "id": "ae-orthanc-modalities",
+    "content": "Orthanc 通过 DicomModalities 配置已知的远端 DICOM 节点。要让 Orthanc 能把 C-MOVE 的影像发给本项目 storescp，必须在 orthanc.json 的 DicomModalities 中加入形如 {\"PULLDATA_SCP\": [\"PULLDATA_SCP\", \"pull-data-storescp\", 11112]} 的条目（AE Title、主机、端口）。缺失或主机名不可解析会导致 C-MOVE 失败。docker compose 环境下主机名应为 storescp 服务名。属于 storescp_receive / ae_config。",
+    "metadata": {"category": "ae_config", "stage": "storescp_receive", "dicom_operation": "c_move", "symptom": "orthanc,dicom modalities,hostname"}
+  },
+  {
+    "id": "ae-bidirectional",
+    "content": "补拉链路的 AE 配置是双向的：C-FIND/C-MOVE 方向要求 PACS 接受 PULLDATA_SCU 作为 Calling AE；C-STORE 回传方向要求 storescp 接受 PACS 作为 Calling AE、并要求 PACS 认识 PULLDATA_SCP 这个 Move Destination。任一方向配置缺失都会断链：查询方向失败表现为 Association 被拒（pacs_connectivity/pacs_query），回传方向失败表现为接收为 0（storescp_receive）。诊断时应结合故障阶段判断是哪个方向的 AE 配置问题。",
+    "metadata": {"category": "ae_config", "stage": "general", "dicom_operation": "none", "symptom": "bidirectional,ae config,scu scp"}
+  }
+]
