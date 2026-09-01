@@ -24,6 +24,51 @@ Orthanc / Mock PACS
 | Checker | **完整性唯一裁判**：`local >= expected` → success；`expected` 缺失 → unverified；超时仍不完整 → fail。success/unverified 同事务直接结束关联 `AgentRun`，不发消息；仅超时不完整发 `failure_stage=integrity` | 不做根因诊断 |
 | Agent Worker | 对**已确认失败**的任务做根因诊断、产出补拉方案 | 不重复证明完整性、不自动执行补拉（必经人工审批） |
 
+## Agent 架构与记忆分层
+
+- LangGraph 编排路由、诊断 ReAct 循环、状态流转、工具调用和人工审批；执行期数据统一保存在 `AgentState`。
+- Redis Checkpointer 按 `thread_id` 持久化 State，负责多轮上下文、任务中断恢复和审批 `interrupt/resume`；`run_id` 只标识单次执行。
+- MySQL 的 `agent_run` 保存任务与最终诊断；`agent_execution_log` 只追加节点、事件、状态摘要和 `tool_id` 引用；`agent_tool_evidence` 按唯一 `tool_id` 独占保存完整工具参数、输出与成功状态；`agent_action_audit` 保存经审批的写操作。
+- Chroma RAG 是独立业务知识库，不承担 Agent checkpoint，也不接收运行时会话经验；执行经验保存在 MySQL 诊断与轨迹记录中。上下文采用 Token Budget + Summary + Recent Raw Messages，滑动窗口只在仍超预算时兜底。
+- 固定 System Prompt 和 Tool Definition 保持稳定前缀，以利用 `qwen-plus` 自动启用的隐式 Prompt Caching；缓存不属于 Memory。
+- Prompt 文本统一托管在 `config/prompts.yml`：包含版本号以及 Reason、诊断、路由、反思、补拉计划、Query Rewrite、RAG 回答和会话摘要的静态规则。Python 装配器将用户、工具、证据和检索内容作为独立 XML 块转义注入；不引入在线 Prompt 平台或 A/B 系统。
+
+诊断引用不再按工具名读取“最近一次结果”。每次工具调用都会生成唯一 `tool_id`，模型使用 `{tool_id, field, value}` 引用具体调用；近期证据直接在 State 中校验，超过 State 窗口的证据按 `tool_id` 从 MySQL 回查。
+
+诊断采用明确的两段式护栏：`verify_diagnosis` 只确定性校验引用的 `tool_id`、会话归属、调用成功状态、字段和值；`reflect` 再统一判断证据充分性、推理有效性和过度归因，并输出 `supported / overstated / unsupported`。后两种状态会按规则降低置信度，`uncertain` 诊断不会生成补拉计划。
+
+`observe` 同时承担轻量 Rule Validator：瞬时工具错误按相同参数自动重试一次，明确错误交回 ReAct 决策；只有 Action、Input 和 Observation 连续不变才触发无进展熔断。首次正常返回的 `unsupported` Reflection 可回到 Reason 补证一次，第二次仍不支持则降为 `uncertain`。模型调用异常不会触发该回环。
+
+MySQL 保存 Agent Run 的 `source_id` 并以唯一 `idempotency_key` 作为审批写操作的最终防重边界；Redis 仅承担快速锁。Downloader 只领取 `in_queue` 任务，Abort 同时持久化取消任务，避免重复消息或 Redis 标记过期后错误执行。
+
+详细边界和恢复语义见 [docs/architecture.md](docs/architecture.md)。
+
+## Hybrid RAG 知识库
+
+项目只有一个在线 RAG 入口：`app.agent.rag.pipeline.search_knowledge(query, context="", category=None, top_n=None)`。知识问答节点、Agent `StructuredTool` 和 MCP 都直接绑定这个函数，不各自封装检索逻辑。处理链固定为：查询规范化/可选上下文改写 → Chroma Dense Top-20 与本地 BM25 Top-20 → RRF(k=60) Top-20 → `qwen3-rerank` → 默认 Top-5。Chroma 显式使用 HNSW：`space=cosine`、`ef_construction=100`、`ef_search=100`、`max_neighbors=16`。启用的任一阶段失败都会直接报错，不使用原查询、单路召回、RRF 顺序或检索摘要兜底。
+
+官方语料清单保存在 `app/agent/rag/sources.yml`，文档本体和下载时的 URL、时间、SHA-256 写入被 Git 忽略的 `data/rag/sources/`。额外 PDF、DOCX、HTML、JSON 可放进 `data/rag/sources/local/`。首版不支持旧 `.doc` 和 OCR；清单文件缺失、文档解析失败或扫描 PDF 无正文都会终止索引构建。PDF 按编号章节并延续跨页章节，DOCX/HTML 保留多级标题路径，JSON 保持知识原子边界；各章节内按段落和句子优先切分，再限制为 800 字符、重叠 120 字符（15%），不同章节不产生重叠。每个 chunk 保存 `doc_id`、`document_hash`、标题、章节、页码范围和内容哈希。
+
+索引首次建立使用全量初始化；文档替换或新增后运行 `python -m app.agent.rag.init_knowledge --incremental`。增量流程先比较 `doc_id + document_hash`，只解析和 Embedding 变化文档，对其 chunk 执行 upsert，并删除已删除文档的旧 chunk；未变化文档不会重复 Embedding。BM25 使用更新后的统一 Chroma corpus 重建一次，保证两路索引不出现 chunk 不一致。
+
+在线请求先由 `route_request` 做意图分类：只有 `knowledge_qa` 设置 `use_rag=true` 并进入知识问答节点，`diagnosis`、`first_pull` 和 `clarification` 不会自动经过 RAG。Agent Tool/MCP 仍注册同一个 `search_knowledge` 函数，但诊断循环调用它会被意图闸门拒绝。
+
+下载官方资料并初始化双索引：
+
+```bash
+docker compose --profile init run --rm rag-init
+```
+
+直接在 Python 环境运行：
+
+```bash
+python -m app.agent.rag.download_sources
+python -m app.agent.rag.init_knowledge
+python -m app.agent.rag.evaluate
+```
+
+初始化需要 `DASHSCOPE_API_KEY` 生成 Dense embedding；在线查询改写只在 `context` 非空时调用 `qwen-plus`。完整来源文档不会提交仓库。
+
 ## Windows + Ubuntu 虚拟机开发说明
 
 本项目推荐在 Ubuntu 虚拟机内运行 Docker Compose。Windows 只作为宿主机和 VS Code 客户端使用。
@@ -83,14 +128,13 @@ docker compose up -d mysql redis rabbitmq orthanc
 再启动业务服务：
 
 ```bash
-docker compose up --build -d pull-data-api pull-data-storescp pull-data-worker pull-data-checker agent-api
+docker compose up --build -d pull-data-api pull-data-storescp pull-data-worker pull-data-checker agent-worker
 ```
 
 健康检查：
 
 ```bash
 curl http://localhost:8000/health
-curl http://localhost:8001/health
 ```
 
 ## 导入测试 DICOM 到 Orthanc
@@ -205,7 +249,7 @@ python3 scripts/import_dicom_to_orthanc.py \
 curl http://localhost:8042/studies
 
 # 4. 启动业务服务
-docker compose up --build -d pull-data-api pull-data-storescp pull-data-worker pull-data-checker agent-api
+docker compose up --build -d pull-data-api pull-data-storescp pull-data-worker pull-data-checker agent-worker
 
 # 5. 测试 C-ECHO
 curl -X POST http://localhost:8000/pacs/orthanc-local/echo
@@ -240,28 +284,29 @@ LIMIT 10;
 
 ## Agent 诊断
 
-按任务诊断：
+创建异步诊断 Run；响应同时返回 `run_id` 和 `thread_id`：
 
 ```bash
-curl -X POST http://localhost:8001/agent/diagnose \
+curl -X POST http://localhost:8000/agent/chat \
   -H "Content-Type: application/json" \
-  -d '{"task_id": "替换为任务 UUID", "source_id": "orthanc-local"}'
+  -d '{"message":"诊断这个补拉任务","task_id":"替换为任务 UUID"}'
 ```
 
-按 Study 诊断：
+后续对话复用响应中的 `thread_id`，Redis Checkpointer 会恢复对应 State：
 
 ```bash
-curl -X POST http://localhost:8001/agent/diagnose \
+curl -X POST http://localhost:8000/agent/chat \
   -H "Content-Type: application/json" \
-  -d '{"study_instance_uid": "1.20251203000331", "source_id": "orthanc-local"}'
+  -d '{"message":"继续分析刚才的问题","thread_id":"替换为会话 ID"}'
 ```
 
-Agent 重试：
+如果 `/agent/chat` 返回 `409` 和 `detail="thread_id 已被占用，请使用新的 thread_id 重试"`，客户端必须生成新的 `thread_id` 后重试；不要等待原请求结束后继续复用冲突 ID。
+
+查询 Run 与订阅过程事件：
 
 ```bash
-curl -X POST http://localhost:8001/agent/retry \
-  -H "Content-Type: application/json" \
-  -d '{"task_id": "替换为任务 UUID"}'
+curl http://localhost:8000/agent/runs/{run_id}
+curl -N http://localhost:8000/agent/runs/{run_id}/stream
 ```
 
 ## 常见失败场景
