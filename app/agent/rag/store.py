@@ -4,7 +4,6 @@
 检索时用 where 做元数据过滤 → 向量召回 Top-K。
 Embedding 通过 DashScope；无 key 时 store 仍可导入，实际 add/query 才触发 key 校验。
 """
-import logging
 import os
 from functools import lru_cache
 from typing import Dict, List, Optional
@@ -14,9 +13,13 @@ from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 from app.agent.rag.embeddings import get_embeddings
 from app.core.config import resolve_project_path, settings
 
-logger = logging.getLogger(__name__)
-
 COLLECTION_NAME = "pacs_knowledge"
+HNSW_CONFIGURATION = {
+    "space": "cosine",
+    "ef_construction": 100,
+    "ef_search": 100,
+    "max_neighbors": 16,
+}
 
 
 class _DashScopeEmbeddingFunction(EmbeddingFunction):
@@ -52,17 +55,15 @@ def get_collection():
     return client.get_or_create_collection(
         name=COLLECTION_NAME,
         embedding_function=_DashScopeEmbeddingFunction(),
-        metadata={"hnsw:space": "cosine"},
+        configuration={"hnsw": HNSW_CONFIGURATION},
     )
 
 
 def reset_collection():
     """重建 collection（初始化脚本用）。"""
     client = _client()
-    try:
+    if any(collection.name == COLLECTION_NAME for collection in client.list_collections()):
         client.delete_collection(COLLECTION_NAME)
-    except Exception:
-        pass
     get_collection.cache_clear()
     return get_collection()
 
@@ -72,18 +73,46 @@ def add_atoms(atoms: List[Dict]) -> int:
     if not atoms:
         return 0
     collection = get_collection()
-    collection.upsert(
-        ids=[a["id"] for a in atoms],
-        documents=[a["content"] for a in atoms],
-        metadatas=[_normalize_metadata(a.get("metadata", {})) for a in atoms],
-    )
+    # 官方文档切分后可能有数千 chunks，分批避免单次 embedding/Chroma payload 过大。
+    for start in range(0, len(atoms), 64):
+        batch = atoms[start:start + 64]
+        collection.upsert(
+            ids=[a["id"] for a in batch],
+            documents=[a["content"] for a in batch],
+            metadatas=[_normalize_metadata(a["metadata"]) for a in batch],
+        )
     return len(atoms)
+
+
+def delete_ids(ids: List[str]) -> int:
+    """删除已移除或已变更文档的旧 chunks。"""
+    if not ids:
+        return 0
+    collection = get_collection()
+    for start in range(0, len(ids), 256):
+        collection.delete(ids=ids[start:start + 256])
+    return len(ids)
+
+
+def list_atoms() -> List[Dict]:
+    """读取当前 Chroma corpus，供增量快照和 BM25 重建共用。"""
+    collection = get_collection()
+    total = collection.count()
+    if not total:
+        return []
+    result = collection.get(include=["documents", "metadatas"])
+    return [
+        {"id": result["ids"][index],
+         "content": result["documents"][index],
+         "metadata": result["metadatas"][index]}
+        for index in range(len(result["ids"]))
+    ]
 
 
 def _normalize_metadata(md: Dict) -> Dict:
     """ChromaDB metadata 只接受标量值；None 转空串，list 转逗号串。"""
     out = {}
-    for k, v in (md or {}).items():
+    for k, v in md.items():
         if v is None:
             out[k] = ""
         elif isinstance(v, (list, tuple)):
@@ -91,7 +120,7 @@ def _normalize_metadata(md: Dict) -> Dict:
         elif isinstance(v, (str, int, float, bool)):
             out[k] = v
         else:
-            out[k] = str(v)
+            raise TypeError("unsupported Chroma metadata type for %s" % k)
     return out
 
 
@@ -102,14 +131,17 @@ def query(
 ) -> List[Dict]:
     """元数据过滤 + 向量召回 Top-K。返回 [{"id","content","metadata","distance"}]。"""
     collection = get_collection()
-    kwargs = {"query_texts": [text], "n_results": k}
+    collection_size = collection.count()
+    if collection_size == 0:
+        return []
+    kwargs = {"query_texts": [text], "n_results": min(k, collection_size)}
     if where:
         kwargs["where"] = where
     res = collection.query(**kwargs)
-    docs = res.get("documents", [[]])[0]
-    metas = res.get("metadatas", [[]])[0]
-    ids = res.get("ids", [[]])[0]
-    dists = res.get("distances", [[]])[0]
+    docs = res["documents"][0]
+    metas = res["metadatas"][0]
+    ids = res["ids"][0]
+    dists = res["distances"][0]
     return [
         {"id": ids[i], "content": docs[i], "metadata": metas[i], "distance": dists[i]}
         for i in range(len(docs))

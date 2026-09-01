@@ -1,1 +1,1 @@
-"""RAG 知识库（spec 第 11 节）：ChromaDB + DashScope embedding + 检索管道 + 经验记忆。"""
+"""Hybrid RAG；唯一公开在线入口是 pipeline.search_knowledge。"""

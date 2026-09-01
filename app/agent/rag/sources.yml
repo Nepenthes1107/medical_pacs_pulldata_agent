@@ -1,0 +1,65 @@
+version: 1
+sources:
+  - id: dicom-ps3.4-2026c
+    title: DICOM PS3.4 Service Class Specifications
+    version: 2026c
+    type: pdf
+    category: dicom_standard
+    filename: dicom-ps3.4-2026c.pdf
+    url: https://dicom.nema.org/medical/dicom/current/output/pdf/part04.pdf
+  - id: dicom-ps3.7-2026c
+    title: DICOM PS3.7 Message Exchange
+    version: 2026c
+    type: pdf
+    category: dicom_standard
+    filename: dicom-ps3.7-2026c.pdf
+    url: https://dicom.nema.org/medical/dicom/current/output/pdf/part07.pdf
+  - id: dicom-ps3.8-2026c
+    title: DICOM PS3.8 Network Communication Support for Message Exchange
+    version: 2026c
+    type: pdf
+    category: dicom_standard
+    filename: dicom-ps3.8-2026c.pdf
+    url: https://dicom.nema.org/medical/dicom/current/output/pdf/part08.pdf
+  - id: dicom-ps3.10-2026c
+    title: DICOM PS3.10 Media Storage and File Format
+    version: 2026c
+    type: pdf
+    category: dicom_standard
+    filename: dicom-ps3.10-2026c.pdf
+    url: https://dicom.nema.org/medical/dicom/current/output/pdf/part10.pdf
+  - id: orthanc-dicom-guide
+    title: Understanding DICOM with Orthanc
+    version: current
+    type: html
+    category: orthanc_doc
+    filename: orthanc-dicom-guide.html
+    url: https://orthanc.uclouvain.be/book/dicom-guide.html
+  - id: orthanc-query-retrieve
+    title: Configuring DICOM Query Retrieve
+    version: current
+    type: html
+    category: orthanc_doc
+    filename: orthanc-query-retrieve.html
+    url: https://orthanc.uclouvain.be/book/faq/query-retrieve.html
+  - id: pynetdicom-query-retrieve-3.0.4
+    title: pynetdicom Query Retrieve Service Class
+    version: 3.0.4
+    type: html
+    category: pynetdicom_doc
+    filename: pynetdicom-query-retrieve-3.0.4.html
+    url: https://pydicom.github.io/pynetdicom/stable/service_classes/query_retrieve_service_class.html
+  - id: pynetdicom-storage-3.0.4
+    title: pynetdicom Storage Service Class
+    version: 3.0.4
+    type: html
+    category: pynetdicom_doc
+    filename: pynetdicom-storage-3.0.4.html
+    url: https://pydicom.github.io/pynetdicom/stable/service_classes/storage_service_class.html
+  - id: pynetdicom-verification-3.0.4
+    title: pynetdicom Verification Service Class
+    version: 3.0.4
+    type: html
+    category: pynetdicom_doc
+    filename: pynetdicom-verification-3.0.4.html
+    url: https://pydicom.github.io/pynetdicom/stable/service_classes/verification_service_class.html
