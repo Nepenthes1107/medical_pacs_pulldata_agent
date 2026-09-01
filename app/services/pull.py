@@ -61,9 +61,7 @@ def create_pull_task(request: PullTaskRequest, db: Session) -> DownloadTask:
     expected_count = _expected_count(request, series_list, study_result, pacs_series, series_instance_uid)
     task_id = str(uuid4())
     task_body = {
-        "study_instance_uid": request.study_instance_uid,
         "series_list": series_list,
-        "skip_pacs_find": request.skip_pacs_find,
     }
 
     if study_result:

@@ -64,19 +64,24 @@ def node_to_event(node_name: str, update: Dict, degraded: bool = False) -> Optio
     """
     ev: Dict = {"type": "node", "node": node_name, "degraded": degraded}
     if node_name == "reason":
-        ev["hypothesis"] = update.get("hypothesis")
         calls = update.get("pending_tool_calls") or []
         ev["next_tools"] = [c.get("name") for c in calls]
         ev["converged"] = update.get("converged", False)
     elif node_name == "act":
         tr = update.get("tool_results") or {}
         ev["observed"] = {name: {"success": out.get("success")} for name, out in tr.items()}
+    elif node_name == "observe":
+        ev["retry_tools"] = [c.get("name") for c in (update.get("pending_tool_calls") or [])]
+        ev["rule_findings"] = (update.get("rule_findings") or [])[-3:]
+        ev["stop_reason"] = update.get("stop_reason")
     elif node_name == "diagnose":
         diag = update.get("diagnosis") or {}
         ev["summary"] = diag.get("summary")
         ev["confidence"] = diag.get("confidence")
     elif node_name == "reflect":
+        # Public SSE shape: {inference_status: supported|overstated|unsupported, reason: str}
         ev["reflection"] = update.get("reflection")
+        ev["revision_attempts"] = update.get("reflection_attempts")
     elif node_name == "plan_repull":
         plan = update.get("repull_plan")
         ev["repull_plan"] = plan

@@ -8,25 +8,81 @@
   storescp_received_count 仅作接收端活动信号（spec §4.2 / §9）。
 - 9 只读工具 + 1 写工具。写工具 execute_repull_plan 不绑定给 LLM、不经 MCP 暴露。
 """
-from typing import Dict, List, Optional
+from typing import Annotated, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+
+# --- 只读工具输入的公共约束类型 ---
+# extra="forbid" + 这些约束共同构成「执行前拦截」：模型编造的未知参数、空串 UID、
+# 负数、越界 top_n 都不会走到真实 PACS/MySQL/RabbitMQ 调用（护栏 3）。
+
+IdStr = Annotated[str, StringConstraints(min_length=1, max_length=64)]
+UidStr = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+QueryStr = Annotated[str, StringConstraints(min_length=1, max_length=500)]
+QueryContextStr = Annotated[str, StringConstraints(max_length=1000)]
+NonNegInt = Annotated[int, Field(ge=0)]
+TopN = Annotated[int, Field(ge=1, le=10)]
+
+# 标准错误码（稳定少量取值，Reason 据此修正下一步调用）。
+ToolErrorCode = Literal[
+    "invalid_arguments",      # 参数校验未过，工具未执行
+    "tool_not_allowed",       # 工具名不在只读注册表内
+    "dependency_unavailable",  # PACS/MQ/DB/知识库等外部依赖不可用
+    "query_failed",           # 依赖可达但查询本身失败
+    "invalid_tool_output",     # 工具返回值不符合输出 Schema
+    "tool_execution_failed",   # 工具执行期未预期异常
+]
+
+
+class BaseToolInput(BaseModel):
+    """所有只读工具输入的基类：禁止未知参数，字符串自动去空白。"""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
 class BaseToolOutput(BaseModel):
-    """所有 Tool 的通用返回字段。"""
+    """所有 Tool 的通用返回字段。
+
+    result_status 把「查询失败」与「查询成功但没有数据」彻底分开：
+    - ok          查询成功且有数据
+    - empty       查询成功但无记录（是可信事实，不是失败）
+    - error       查询失败（不得据此断言目标不存在）
+    - unavailable 外部依赖不可用
+    success/error/retryable 保留兼容现有 Observe / Evidence / 审计逻辑。
+    """
 
     success: bool  # 必填，禁止因默认值遗漏真实失败
-    error: str = ""  # 空字符串 = 无错误
+    result_status: Literal["ok", "empty", "error", "unavailable"] = "ok"
+    error: str = ""  # 空字符串 = 无错误；只放安全摘要，绝不放原始异常
+    error_code: Optional[ToolErrorCode] = None
+    correction: Optional[str] = None  # 给 LLM 的可执行修正方向
     retryable: bool = False  # 网络超时、连接失败等瞬时错误可重试
+
+    @model_validator(mode="after")
+    def _sync_status(self):
+        """未显式给 result_status 时按 success 推导，并拦截自相矛盾的组合。"""
+        if "result_status" not in self.model_fields_set:
+            self.result_status = "ok" if self.success else "error"
+        elif self.success and self.result_status == "error":
+            self.result_status = "ok"
+        elif not self.success and self.result_status in ("ok", "empty"):
+            self.result_status = "error"
+        return self
 
 
 # --- query_pacs_target：只答连通性/存在性/期望数（不再顺带查层级）---
 
-class PacsTargetInput(BaseModel):
-    source_id: str = Field(..., description="PACS 数据源 ID")
-    study_instance_uid: Optional[str] = Field(None, description="Study Instance UID")
-    series_instance_uid: Optional[str] = Field(None, description="Series Instance UID")
+class PacsTargetInput(BaseToolInput):
+    source_id: IdStr = Field(..., description="PACS 数据源 ID")
+    study_instance_uid: Optional[UidStr] = Field(None, description="Study Instance UID")
+    series_instance_uid: Optional[UidStr] = Field(None, description="Series Instance UID")
+
+    @model_validator(mode="after")
+    def _series_requires_study(self):
+        # C-FIND SERIES 必须在所属 Study 下检索，缺父 Study 直接判非法，不发起查询。
+        if self.series_instance_uid and not self.study_instance_uid:
+            raise ValueError("series_instance_uid requires study_instance_uid")
+        return self
 
 
 class PacsTargetOutput(BaseToolOutput):
@@ -41,9 +97,9 @@ class PacsTargetOutput(BaseToolOutput):
 
 # --- query_pacs_hierarchy：Study 下各 Series 期望数，支撑 LLM 下钻 ---
 
-class PacsHierarchyInput(BaseModel):
-    source_id: str = Field(..., description="PACS 数据源 ID")
-    study_instance_uid: str = Field(..., description="Study Instance UID")
+class PacsHierarchyInput(BaseToolInput):
+    source_id: IdStr = Field(..., description="PACS 数据源 ID")
+    study_instance_uid: UidStr = Field(..., description="Study Instance UID")
 
 
 class SeriesNode(BaseModel):
@@ -60,10 +116,17 @@ class PacsHierarchyOutput(BaseToolOutput):
 
 # --- query_task_context：只返回当前任务状态与阶段时间线 ---
 
-class TaskContextInput(BaseModel):
-    task_id: Optional[str] = Field(None, description="任务 ID")
-    study_instance_uid: Optional[str] = Field(None, description="Study Instance UID")
-    series_instance_uid: Optional[str] = Field(None, description="Series Instance UID")
+class TaskContextInput(BaseToolInput):
+    task_id: Optional[IdStr] = Field(None, description="任务 ID")
+    study_instance_uid: Optional[UidStr] = Field(None, description="Study Instance UID")
+    series_instance_uid: Optional[UidStr] = Field(None, description="Series Instance UID")
+
+    @model_validator(mode="after")
+    def _require_one_locator(self):
+        # 三者全空 → 会全表扫 download_task，执行前拦掉。
+        if not any([self.task_id, self.study_instance_uid, self.series_instance_uid]):
+            raise ValueError("at least one of task_id/study_instance_uid/series_instance_uid")
+        return self
 
 
 class TaskSummary(BaseModel):
@@ -87,10 +150,16 @@ class TaskContextOutput(BaseToolOutput):
 
 # --- query_task_history：历史重试次数、错误演变，支撑「反复失败该上报」判断 ---
 
-class TaskHistoryInput(BaseModel):
-    task_id: Optional[str] = Field(None, description="任务 ID")
-    study_instance_uid: Optional[str] = Field(None, description="Study Instance UID")
-    series_instance_uid: Optional[str] = Field(None, description="Series Instance UID")
+class TaskHistoryInput(BaseToolInput):
+    task_id: Optional[IdStr] = Field(None, description="任务 ID")
+    study_instance_uid: Optional[UidStr] = Field(None, description="Study Instance UID")
+    series_instance_uid: Optional[UidStr] = Field(None, description="Series Instance UID")
+
+    @model_validator(mode="after")
+    def _require_one_locator(self):
+        if not any([self.task_id, self.study_instance_uid, self.series_instance_uid]):
+            raise ValueError("at least one of task_id/study_instance_uid/series_instance_uid")
+        return self
 
 
 class TaskHistoryOutput(BaseToolOutput):
@@ -104,9 +173,9 @@ class TaskHistoryOutput(BaseToolOutput):
 
 # --- query_worker_health（合并旧 query_queue_status）：Worker 存活 + 消费者 + 积压 ---
 
-class WorkerHealthInput(BaseModel):
+class WorkerHealthInput(BaseToolInput):
     # 按需工具：无业务参数，队列名默认取配置的 download_queue。
-    queue_name: Optional[str] = Field(None, description="队列名，缺省用下载队列")
+    queue_name: Optional[IdStr] = Field(None, description="队列名，缺省用下载队列")
 
 
 class WorkerHealthOutput(BaseToolOutput):
@@ -120,9 +189,9 @@ class WorkerHealthOutput(BaseToolOutput):
 
 # --- query_receive_status：storescp 活动信号 + 本地扫描（唯一 SOP 以本地为权威）---
 
-class ReceiveStatusInput(BaseModel):
-    study_instance_uid: str = Field(..., description="Study Instance UID")
-    series_instance_uid: Optional[str] = Field(None, description="指定时仅统计该 Series")
+class ReceiveStatusInput(BaseToolInput):
+    study_instance_uid: UidStr = Field(..., description="Study Instance UID")
+    series_instance_uid: Optional[UidStr] = Field(None, description="指定时仅统计该 Series")
 
 
 class ReceiveStatusOutput(BaseToolOutput):
@@ -136,10 +205,10 @@ class ReceiveStatusOutput(BaseToolOutput):
 
 # --- compute_integrity（护栏 1）：只做算术，不做任何根因判断 ---
 
-class ComputeIntegrityInput(BaseModel):
-    expected: Optional[int] = Field(None, description="期望数量（来自 PACS，可为 None）")
-    local_unique_sop: int = Field(0, description="本地唯一 SOP 数（权威计数）")
-    level: str = Field("study", description="'study' | 'series' | 'sop'")
+class ComputeIntegrityInput(BaseToolInput):
+    expected: Optional[NonNegInt] = Field(None, description="期望数量（来自 PACS，可为 None）")
+    local_unique_sop: NonNegInt = Field(..., description="本地唯一 SOP 数（权威计数）")
+    level: Literal["study", "series", "sop"] = Field("study", description="诊断层级")
 
 
 class ComputeIntegrityOutput(BaseToolOutput):
@@ -152,10 +221,10 @@ class ComputeIntegrityOutput(BaseToolOutput):
 
 # --- query_missing_instances：IMAGE 级差集，给出 sop 粒度补拉目标 ---
 
-class MissingInstancesInput(BaseModel):
-    source_id: str = Field(..., description="PACS 数据源 ID")
-    study_instance_uid: str = Field(..., description="Study Instance UID")
-    series_instance_uid: str = Field(..., description="Series Instance UID")
+class MissingInstancesInput(BaseToolInput):
+    source_id: IdStr = Field(..., description="PACS 数据源 ID")
+    study_instance_uid: UidStr = Field(..., description="Study Instance UID（Series 所属 Study，必填）")
+    series_instance_uid: UidStr = Field(..., description="Series Instance UID")
 
 
 class MissingInstancesOutput(BaseToolOutput):
@@ -171,22 +240,47 @@ class MissingInstancesOutput(BaseToolOutput):
 
 # --- search_knowledge（Agentic RAG）：LLM 按需查知识 ---
 
-class SearchKnowledgeInput(BaseModel):
-    query: str = Field(..., description="检索查询文本（症状/故障描述/知识问题）")
-    category: Optional[str] = Field(None, description="可选类目过滤，如 fault_sop / experience")
-    top_n: Optional[int] = Field(None, description="返回条数，缺省用配置 top_k")
+class SearchKnowledgeInput(BaseToolInput):
+    query: QueryStr = Field(..., description="检索查询文本（症状/故障描述/知识问题）")
+    context: QueryContextStr = Field("", description="可选会话摘要，不代表经工具验证的事实")
+    recent_user_messages: List[QueryStr] = Field(
+        default_factory=list, max_length=3,
+        description="最近最多 3 条用户消息，用于消解代词和省略条件；不含系统/工具消息",
+    )
+    task_id: Optional[IdStr] = Field(
+        None, description="当前请求携带的任务 ID，仅用于检索式补全，不验证是否存在",
+    )
+    study_instance_uid: Optional[UidStr] = Field(
+        None, description="当前请求携带的 Study UID，仅用于检索式补全，不验证是否存在",
+    )
+    series_instance_uid: Optional[UidStr] = Field(
+        None, description="当前请求携带的 Series UID，仅用于检索式补全，不验证是否存在",
+    )
+    category: Optional[IdStr] = Field(None, description="可选类目过滤，如 fault_sop / experience")
+    top_n: Optional[TopN] = Field(None, description="返回条数 1..10，缺省用配置 top_k")
 
 
 class KnowledgeItem(BaseModel):
+    chunk_id: str
     content: str
     category: Optional[str] = None
     source: Optional[str] = None
+    title: Optional[str] = None
+    version: Optional[str] = None
+    section: Optional[str] = None
+    page: Optional[int] = None
+    url: Optional[str] = None
+    vector_distance: Optional[float] = None
+    bm25_score: Optional[float] = None
+    rrf_score: Optional[float] = None
+    rerank_score: Optional[float] = None
 
 
 class SearchKnowledgeOutput(BaseToolOutput):
-    query: str = ""
+    original_query: str
+    effective_query: str
+    rewrite_used: bool
     hits: List[KnowledgeItem] = Field(default_factory=list)
-    available: bool = True  # embedding/知识库是否可用
 
 
 # --- execute_repull_plan（写工具，不绑定给模型，仅审批后由固定节点执行）---
@@ -242,31 +336,12 @@ CONFIDENCE_LEVELS = {"confirmed", "high", "uncertain"}
 REPULL_STRATEGIES = {"retry_task", "targeted_cmove", "escalate"}
 
 
-class ToolCallRequest(BaseModel):
-    """reason 决定的一次工具调用（name + args）。"""
-
-    name: str
-    args: Dict = Field(default_factory=dict)
-
-
-class ReasonDecision(BaseModel):
-    """reason 节点的结构化输出（Stage C）：更新假设 + 决定下一步。
-
-    converged=True → 证据足够，进入 diagnose；否则 tool_calls 非空，继续采证。
-    工具名/参数在 act 前过白名单与 Pydantic，模型越界调用会被拒绝（护栏 3/4）。
-    """
-
-    hypothesis: str = ""  # 当前根因假设（随轮次更新）
-    converged: bool = False
-    tool_calls: List[ToolCallRequest] = Field(default_factory=list)
-
-
 class EvidenceRef(BaseModel):
-    """一条事实断言的来源引用（护栏 2）：哪个工具的哪个字段、值是多少。"""
+    """一条事实断言的精确来源：哪一次工具调用的哪个字段、值是多少。"""
 
-    tool: str
+    tool_id: str
     field: str
-    value: Optional[object] = None
+    value: Optional[object]
 
 
 class Claim(BaseModel):
@@ -292,13 +367,11 @@ class GroundedDiagnosis(BaseModel):
             self.confidence = "uncertain"
         return self
 
-
 class Reflection(BaseModel):
-    """reflect 自检输出（护栏 7）：结论能否由所引证据推出、有无过度归因。"""
+    """reflect 的单一推理判定；三态同时表达支持程度与是否过度归因。"""
 
-    supported: bool = True  # 结论是否被证据支持
-    over_attribution: bool = False  # 是否过度归因
-    notes: str = ""
+    inference_status: Literal["supported", "overstated", "unsupported"]
+    reason: str
 
 
 class SeriesRepullTarget(BaseModel):
@@ -351,13 +424,3 @@ class RepullPlan(BaseModel):
         if self.confidence not in CONFIDENCE_LEVELS:
             self.confidence = "uncertain"
         return self
-
-
-class FaultSignature(BaseModel):
-    """经验记忆去重签名（需求 5）：LLM 把自由文本根因归一化为一个规范 slug。
-
-    约束为单个短标签（如 worker_crash_in_queue），防自由发挥；
-    route_request/write_experience 侧会做清洗（小写、下划线、截断）。
-    """
-
-    signature: str = ""  # 规范化故障签名 slug

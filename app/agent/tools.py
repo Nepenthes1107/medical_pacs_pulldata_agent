@@ -4,11 +4,11 @@ from typing import List, Optional
 
 import pika
 from langchain_core.tools import StructuredTool
+from sqlalchemy.exc import IntegrityError
 
 from app.agent.tool_schemas import (
     ComputeIntegrityInput,
     ComputeIntegrityOutput,
-    KnowledgeItem,
     MissingInstancesInput,
     MissingInstancesOutput,
     PacsHierarchyInput,
@@ -18,7 +18,6 @@ from app.agent.tool_schemas import (
     ReceiveStatusInput,
     ReceiveStatusOutput,
     SearchKnowledgeInput,
-    SearchKnowledgeOutput,
     SeriesNode,
     TaskContextInput,
     TaskContextOutput,
@@ -29,6 +28,7 @@ from app.agent.tool_schemas import (
     WorkerHealthOutput,
     derive_repull_level,
 )
+from app.agent.rag.pipeline import search_knowledge
 from app.core.config import settings
 from app.core.database import session_scope
 from app.core.enums import DownloadStatus
@@ -62,6 +62,25 @@ def _iso(dt) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
+def _safe_failure(tool: str, exc: Exception, what: str) -> dict:
+    """把原始异常收敛为安全摘要：细节只进服务端日志，返回值不含连接串/凭据/堆栈。
+
+    返回给 LLM、State 和 agent_tool_evidence.output 的只有「哪个环节失败 + 异常类型」，
+    避免数据库 DSN、PACS 主机凭据经证据链外泄。
+    """
+    logger.warning("%s %s 失败: %s", tool, what, exc, exc_info=True)
+    transient = _is_transient(str(exc))
+    return {
+        "success": False,
+        "result_status": "unavailable" if transient else "error",
+        "error": "%s failed (%s)" % (what, type(exc).__name__),
+        "error_code": "dependency_unavailable" if transient else "query_failed",
+        "correction": ("依赖暂时不可用，可稍后重试或改查其它信号"
+                       if transient else "该查询失败，不能据此断言目标不存在；换用其它工具或收束"),
+        "retryable": transient,
+    }
+
+
 def query_pacs_target(
     source_id: str,
     study_instance_uid: Optional[str] = None,
@@ -74,12 +93,18 @@ def query_pacs_target(
     out.dicom_status_summary = echo.message
     if not echo.ok:
         # 不可达是可信的业务事实：success=True 但 pacs_reachable=False（spec 9.0）。
+        out.result_status = "unavailable"
         out.retryable = _is_transient(echo.message)
+        out.correction = "PACS 不可达，无需继续查本地/层级；先确认链路"
         return out
     try:
         if series_instance_uid:
             if not study_instance_uid:
-                return PacsTargetOutput(success=False, error="series query requires study_instance_uid")
+                # 正常路径由 PacsTargetInput 校验拦截；此处兜底直接调用场景。
+                return PacsTargetOutput(
+                    success=False, error="series query requires study_instance_uid",
+                    error_code="invalid_arguments", correction="补充 study_instance_uid",
+                )
             series = client.find_series(source_id, study_instance_uid)
             match = next((s for s in series if s.series_instance_uid == series_instance_uid), None)
             out.study_exists = True
@@ -97,10 +122,9 @@ def query_pacs_target(
                 out.modality = match.modality
         return out
     except Exception as exc:  # C-FIND 失败
-        msg = str(exc)
         return PacsTargetOutput(
-            success=False, error="C-FIND failed: %s" % msg, retryable=_is_transient(msg),
             pacs_reachable=True, dicom_status_summary=echo.message,
+            **_safe_failure("query_pacs_target", exc, "C-FIND"),
         )
 
 
@@ -111,7 +135,11 @@ def query_task_context(
 ) -> TaskContextOutput:
     """查询 download_task 及其阶段时间线，映射为 TaskSummary。"""
     if not any([task_id, study_instance_uid, series_instance_uid]):
-        return TaskContextOutput(success=False, error="at least one of task_id/study/series uid is required")
+        return TaskContextOutput(
+            success=False, error="at least one of task_id/study/series uid is required",
+            error_code="invalid_arguments",
+            correction="补充 task_id 或 study_instance_uid 或 series_instance_uid",
+        )
     try:
         with session_scope() as db:
             q = db.query(DownloadTask)
@@ -133,9 +161,11 @@ def query_task_context(
                 )
                 for t in rows
             ]
-        return TaskContextOutput(success=True, tasks=summaries)
+        # 无记录是「查询成功但没有数据」，不是失败——result_status=empty。
+        return TaskContextOutput(success=True, tasks=summaries,
+                                 result_status="ok" if summaries else "empty")
     except Exception as exc:
-        return TaskContextOutput(success=False, error="task query failed: %s" % exc)
+        return TaskContextOutput(**_safe_failure("query_task_context", exc, "task query"))
 
 
 def query_receive_status(
@@ -157,8 +187,11 @@ def query_receive_status(
             received_times = sorted(r.received_at for r in rows if r.received_at)
         # 本地扫描（scanner 已支持 series 过滤）——唯一 SOP 的权威口径。
         summary = scan_local_dicom(study_instance_uid, series_instance_uid)
+        # 接收端与本地都为 0 → 查询成功但确无数据（empty），区别于查询失败。
+        nothing = received_count == 0 and summary["total_sop_count"] == 0
         return ReceiveStatusOutput(
             success=True,
+            result_status="empty" if nothing else "ok",
             storescp_received_count=received_count,
             local_parsed_count=summary["total_files"],
             local_unique_sop_count=summary["total_sop_count"],
@@ -167,7 +200,7 @@ def query_receive_status(
             series_distribution=summary.get("series", {}),
         )
     except Exception as exc:
-        return ReceiveStatusOutput(success=False, error="receive status query failed: %s" % exc)
+        return ReceiveStatusOutput(**_safe_failure("query_receive_status", exc, "receive status query"))
 
 
 # ==========================================================================
@@ -180,10 +213,9 @@ def query_pacs_hierarchy(source_id: str, study_instance_uid: str) -> PacsHierarc
     try:
         series = PacsClient().find_series(source_id, study_instance_uid)
     except Exception as exc:
-        msg = str(exc)
         return PacsHierarchyOutput(
-            success=False, error="C-FIND series failed: %s" % msg,
-            retryable=_is_transient(msg), study_instance_uid=study_instance_uid,
+            study_instance_uid=study_instance_uid,
+            **_safe_failure("query_pacs_hierarchy", exc, "C-FIND series"),
         )
     nodes = [
         SeriesNode(
@@ -194,7 +226,8 @@ def query_pacs_hierarchy(source_id: str, study_instance_uid: str) -> PacsHierarc
         for s in series
     ]
     return PacsHierarchyOutput(
-        success=True, study_instance_uid=study_instance_uid,
+        success=True, result_status="ok" if nodes else "empty",
+        study_instance_uid=study_instance_uid,
         series_count=len(nodes), series=nodes,
     )
 
@@ -206,7 +239,11 @@ def query_task_history(
 ) -> TaskHistoryOutput:
     """返回目标的累计重试次数、去重错误演变，支撑「反复失败该上报」判断。"""
     if not any([task_id, study_instance_uid, series_instance_uid]):
-        return TaskHistoryOutput(success=False, error="at least one of task_id/study/series uid is required")
+        return TaskHistoryOutput(
+            success=False, error="at least one of task_id/study/series uid is required",
+            error_code="invalid_arguments",
+            correction="补充 task_id 或 study_instance_uid 或 series_instance_uid",
+        )
     try:
         with session_scope() as db:
             q = db.query(DownloadTask)
@@ -218,7 +255,8 @@ def query_task_history(
                 q = q.filter(DownloadTask.series_instance_uid == series_instance_uid)
             rows = q.order_by(DownloadTask.created_at.desc()).all()
             if not rows:
-                return TaskHistoryOutput(success=True, task_id=task_id or "", current_status="")
+                return TaskHistoryOutput(success=True, result_status="empty",
+                                         task_id=task_id or "", current_status="")
             latest = rows[0]
             total_retry = max((t.task_retry_times or 0) for t in rows)
             # 去重历史错误（保序）。
@@ -238,7 +276,7 @@ def query_task_history(
                 last_error=latest.last_error, repeatedly_failing=repeatedly,
             )
     except Exception as exc:
-        return TaskHistoryOutput(success=False, error="task history query failed: %s" % exc)
+        return TaskHistoryOutput(**_safe_failure("query_task_history", exc, "task history query"))
 
 
 def query_worker_health(queue_name: Optional[str] = None) -> WorkerHealthOutput:
@@ -260,11 +298,11 @@ def query_worker_health(queue_name: Optional[str] = None) -> WorkerHealthOutput:
             backlog_likely=(msg_count > 0 and consumer_count == 0),
         )
     except Exception as exc:
-        msg = str(exc)
-        return WorkerHealthOutput(
-            success=False, error="worker health query failed: %s" % msg,
-            retryable=_is_transient(msg), queue_name=name, queue_accessible=False,
-        )
+        # RabbitMQ 不可达按依赖不可用返回，且异常里可能含 AMQP URL，必须走安全摘要。
+        failure = _safe_failure("query_worker_health", exc, "worker health query")
+        failure["result_status"] = "unavailable"
+        failure["error_code"] = "dependency_unavailable"
+        return WorkerHealthOutput(queue_name=name, queue_accessible=False, **failure)
     finally:
         try:
             if connection and connection.is_open:
@@ -309,57 +347,29 @@ def query_missing_instances(
     try:
         instances = PacsClient().find_instances(source_id, study_instance_uid, series_instance_uid)
     except Exception as exc:
-        msg = str(exc)
         return MissingInstancesOutput(
-            success=False, error="C-FIND image failed: %s" % msg, retryable=_is_transient(msg),
             study_instance_uid=study_instance_uid, series_instance_uid=series_instance_uid,
+            **_safe_failure("query_missing_instances", exc, "C-FIND image"),
         )
     try:
         summary = scan_local_dicom(study_instance_uid, series_instance_uid)
     except Exception as exc:
         return MissingInstancesOutput(
-            success=False, error="local scan failed: %s" % exc,
             study_instance_uid=study_instance_uid, series_instance_uid=series_instance_uid,
+            **_safe_failure("query_missing_instances", exc, "local scan"),
         )
 
     pacs_sops = {i.sop_instance_uid for i in instances if i.sop_instance_uid}
     local_sops = set(summary.get("sop_instance_uid_list") or [])
     missing = sorted(pacs_sops - local_sops)
+    # missing_count=0 表示「已完整」，是 ok；两侧都没有 SOP 才是 empty。
     return MissingInstancesOutput(
-        success=True, study_instance_uid=study_instance_uid, series_instance_uid=series_instance_uid,
+        success=True,
+        result_status="empty" if (not pacs_sops and not local_sops) else "ok",
+        study_instance_uid=study_instance_uid, series_instance_uid=series_instance_uid,
         pacs_sop_count=len(pacs_sops), local_sop_count=len(local_sops),
         missing_count=len(missing), missing_sop_instance_uids=missing,
     )
-
-
-def search_knowledge(
-    query: str,
-    category: Optional[str] = None,
-    top_n: Optional[int] = None,
-) -> SearchKnowledgeOutput:
-    """Agentic RAG：LLM 自己决定何时查知识，而非固定检索节点。"""
-    try:
-        from app.agent.rag import retriever
-        from app.agent.rag.embeddings import embeddings_available
-
-        if not embeddings_available():
-            return SearchKnowledgeOutput(
-                success=True, query=query, available=False,
-                error="embedding/knowledge base unavailable",
-            )
-        where = {"category": category} if category else None
-        items = retriever.retrieve(query, where=where, top_n=top_n)
-        hits = [
-            KnowledgeItem(
-                content=(it.get("content") or "")[:300],
-                category=(it.get("metadata") or {}).get("category"),
-                source=(it.get("metadata") or {}).get("source"),
-            )
-            for it in items
-        ]
-        return SearchKnowledgeOutput(success=True, query=query, hits=hits, available=True)
-    except Exception as exc:
-        return SearchKnowledgeOutput(success=False, query=query, error="knowledge search failed: %s" % exc)
 
 
 # StructuredTool 封装：暴露 Pydantic args_schema 给 bind_tools，参数非法由 Pydantic 拦截。
@@ -433,8 +443,13 @@ READ_ONLY_TOOLS: List[StructuredTool] = [
 ]
 READ_ONLY_TOOL_NAMES = {t.name for t in READ_ONLY_TOOLS}
 
-# 写工具断言：绝不在只读白名单内（护栏 4）。
+# 唯一工具注册表：Reason 绑定给模型的工具与 act 实际执行的工具共用这一份。
+# 单一来源保证「模型可见工具」与「工程允许工具」不会分叉——分叉就等于给幻觉留门。
+TOOL_REGISTRY = {t.name: t for t in READ_ONLY_TOOLS}
+
+# 写工具断言：绝不在只读白名单/注册表内（护栏 4）。
 assert "execute_repull_plan" not in READ_ONLY_TOOL_NAMES, "写工具不得进入只读白名单"
+assert "execute_repull_plan" not in TOOL_REGISTRY, "写工具不得进入工具注册表"
 
 
 # ==========================================================================
@@ -514,8 +529,14 @@ def execute_repull_plan(
     if strategy not in _VALID_STRATEGIES:
         return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id or "",
                                      error="unknown strategy: %s" % strategy)
+    idempotency_key = (idempotency_key or "").strip()
+    if not idempotency_key:
+        return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id or "",
+                                     error="idempotency_key is required")
     targets = _clean_targets(missing_targets)
-    audit_task_id = task_id or study_instance_uid or ""
+    # 新建任务场景先用空值占位，任务创建成功后再更新为真实 UUID；避免把 Study UID
+    # 塞进长度与语义都只属于 task_id 的审计列。
+    audit_task_id = task_id or ""
 
     # 1) Redis 短期锁：SET idempotency:{key} {run_id} NX EX ttl，防审批接口并发重复提交。
     lock_key = "idempotency:%s" % idempotency_key
@@ -528,6 +549,11 @@ def execute_repull_plan(
     if not acquired:
         return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id or "",
                                      error="duplicate execution within lock TTL")
+
+    # Redis 只做快速拦截；MySQL 唯一键是锁过期、重启或 replay 后的最终幂等边界。
+    if not _claim_action(run_id, audit_task_id, operator, idempotency_key, strategy, targets):
+        return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id or "",
+                                     error="duplicate execution")
 
     try:
         # escalate：只写审计 + 标记上报，不投递队列（护栏 6：知道该放手时放手）。
@@ -547,6 +573,7 @@ def execute_repull_plan(
         if existing is None or (strategy == "targeted_cmove" and targets):
             study_uid = study_instance_uid or (existing or {}).get("study_instance_uid")
             if not study_uid:
+                _mark_action_failed(idempotency_key, "task not found and no study_instance_uid")
                 return RepullExecutionOutput(
                     success=False, strategy=strategy, task_id=task_id or "",
                     error="task not found and no study_instance_uid to create a repull task")
@@ -560,6 +587,7 @@ def execute_repull_plan(
         # 有既有任务且无定向目标 → 原任务整体重投。
         return _submit_repull(run_id, task_id, strategy, idempotency_key, operator, force)
     except Exception as exc:
+        _mark_action_failed(idempotency_key, str(exc))
         return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id or "",
                                      error="execute failed: %s" % exc)
 
@@ -679,7 +707,21 @@ def _submit_repull(run_id, task_id, strategy, idempotency_key, operator, force):
         db.flush()
         audit_id = str(audit.id)
     # 投递 RabbitMQ（事务提交后），只返回 in_queue，不等待补拉完成。
-    publish_download_task(message)
+    try:
+        publish_download_task(message)
+    except Exception as exc:
+        error = "RabbitMQ publish failed: %s" % exc
+        with session_scope() as db:
+            task = db.query(DownloadTask).filter(DownloadTask.task_id == task_id).first()
+            if task and task.status == DownloadStatus.IN_QUEUE.value:
+                task.status = DownloadStatus.FAIL.value
+                task.last_error = error
+                task.failed_at = datetime.utcnow()
+            _audit(db, run_id, task_id, operator, idempotency_key, "failed", strategy,
+                   {"error": error})
+        return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id,
+                                     new_status=DownloadStatus.FAIL.value,
+                                     audit_log_id=audit_id, error=error, retryable=True)
     return RepullExecutionOutput(success=True, strategy=strategy, task_id=task_id,
                                  new_status=DownloadStatus.IN_QUEUE.value, audit_log_id=audit_id,
                                  submitted=True, degraded=degraded, created_task=False,
@@ -689,10 +731,47 @@ def _submit_repull(run_id, task_id, strategy, idempotency_key, operator, force):
 def _audit(db, run_id, task_id, operator, idempotency_key, result, action, detail):
     from app.core.models import AgentActionAudit
 
-    # action 列为 String(32)：用短前缀 "repull:<strategy>"（≤21 字符）避免 MySQL 截断。
-    audit = AgentActionAudit(
-        run_id=run_id, task_id=task_id, action="repull:%s" % action, operator=operator,
-        idempotency_key=idempotency_key, result=result, detail=detail,
-    )
-    db.add(audit)
+    audit = (db.query(AgentActionAudit)
+             .filter(AgentActionAudit.idempotency_key == idempotency_key)
+             .one())
+    audit.run_id = run_id
+    audit.task_id = task_id
+    audit.action = "repull:%s" % action
+    audit.operator = operator
+    audit.result = result
+    audit.detail = detail
     return audit
+
+
+def _claim_action(run_id, task_id, operator, idempotency_key, strategy, targets) -> bool:
+    """先写 processing 审计占用唯一键；重复键在任何副作用发生前返回 False。"""
+    from app.core.models import AgentActionAudit
+
+    try:
+        with session_scope() as db:
+            db.add(AgentActionAudit(
+                run_id=run_id,
+                task_id=task_id,
+                action="repull:%s" % strategy,
+                operator=operator,
+                idempotency_key=idempotency_key,
+                result="processing",
+                detail={"missing_targets": targets},
+            ))
+            db.flush()
+        return True
+    except IntegrityError:
+        return False
+
+
+def _mark_action_failed(idempotency_key: str, error: str) -> None:
+    """把已占位但未完成的动作收敛为 failed。"""
+    from app.core.models import AgentActionAudit
+
+    with session_scope() as db:
+        audit = (db.query(AgentActionAudit)
+                 .filter(AgentActionAudit.idempotency_key == idempotency_key)
+                 .first())
+        if audit:
+            audit.result = "failed"
+            audit.detail = {"error": error}

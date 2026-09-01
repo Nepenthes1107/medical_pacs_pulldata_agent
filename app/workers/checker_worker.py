@@ -124,7 +124,7 @@ def _complete_awaiting_run(
 
 
 def _finish_completed_runs(completed_runs) -> None:
-    """事务提交后处理 Checker 直接收尾的 Run：结束 SSE + best-effort 写经验。"""
+    """事务提交后结束 Checker 已直接收尾 Run 的 SSE。"""
     if not completed_runs:
         return
     from app.agent import events as ev
@@ -134,13 +134,6 @@ def _finish_completed_runs(completed_runs) -> None:
             ev.mark_done(item["run_id"])
         except Exception as exc:  # noqa: BLE001
             logger.warning("mark_done 失败（不影响已提交的 Run 终态）: %s", exc)
-        if item["outcome"] == "success":
-            try:
-                from app.agent.rag.experience import write_verified_repull_experience
-
-                write_verified_repull_experience(item["run_id"], item["proposed_action"])
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("经验记忆写入失败（不影响 Checker 收尾）: %s", exc)
 
 
 def _emit_repull_failures(events) -> None:
@@ -247,6 +240,7 @@ def _mark_unverified(task: DownloadTask, archive: Optional[ArchiveModel], local_
     task.last_error = UNVERIFIED_MESSAGE
     task.checked_at = datetime.utcnow()
     if archive:
+        archive.status = ArchiveStatus.UNVERIFIED.value
         archive.archived_image_count = local_count
         archive.checked = True
         archive.last_error = UNVERIFIED_MESSAGE

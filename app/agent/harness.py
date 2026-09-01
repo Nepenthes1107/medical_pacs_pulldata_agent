@@ -5,7 +5,7 @@
 也绝不在这里写「if fault_stage==X」这类根因判断规则（那是被删掉的规则引擎）。
 """
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -42,53 +42,132 @@ def _resolve_field(output: Dict, field: str):
 
 
 def _values_match(expected, actual) -> bool:
-    """值匹配：数值按相等比较，字符串按 strip 比较，None 视为通配（只校验字段存在）。"""
-    if expected is None:
-        return True
+    """值匹配：引用必须显式给值；None 也只能匹配真实的 None。"""
+    if expected is None or actual is None:
+        return expected is actual
     if isinstance(expected, bool) or isinstance(actual, bool):
         return expected == actual
     if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
         return float(expected) == float(actual)
+    if isinstance(expected, (list, dict)) or isinstance(actual, (list, dict)):
+        return expected == actual
     return str(expected).strip() == str(actual).strip()
 
 
-def verify_citations(diagnosis: Dict, tool_results: Dict) -> Tuple[bool, List[str]]:
-    """逐条核对 claims[].evidence_refs：工具调过吗？字段在吗？值对得上吗？
+def resolve_evidence_refs(
+    refs: Iterable[Dict],
+    recent_evidence: List[Dict],
+    thread_id: str,
+) -> Dict[str, Dict]:
+    """统一解析引用：优先近期 State，缺失部分按当前 thread_id 从 MySQL 回查。"""
+    refs = list(refs)
+    evidence_by_id = {
+        item["tool_id"]: item
+        for item in recent_evidence
+        if item.get("tool_id") and item.get("thread_id") == thread_id
+    }
+    missing_ids = list({
+        ref.get("tool_id") for ref in refs
+        if ref.get("tool_id") and ref.get("tool_id") not in evidence_by_id
+    })
+    if missing_ids:
+        from app.agent.audit import load_tool_evidence
 
-    返回 (all_grounded, violations)。violations 为人类可读的失败原因，供 reflect 修正。
-    无 claims 视为未接地（不能凭空下确定结论）——但 uncertain 诊断允许无 claims（见调用方）。
-    """
+        evidence_by_id.update(load_tool_evidence(missing_ids, thread_id))
+    return evidence_by_id
+
+
+def _citation_violations(claims: List[Dict], evidence_by_id: Dict[str, Dict]) -> List[str]:
+    """在已解析的证据集上执行纯确定性校验。"""
     violations: List[str] = []
-    claims = diagnosis.get("claims", []) or []
-
     for idx, claim in enumerate(claims):
-        refs = claim.get("evidence_refs", []) or []
-        if not refs:
+        claim_refs = claim.get("evidence_refs", []) or []
+        if not claim_refs:
             violations.append("claim[%d] 无 evidence_refs：'%s'" % (idx, claim.get("claim", "")[:40]))
             continue
-        for ref in refs:
-            tool = ref.get("tool")
+        for ref in claim_refs:
+            tool_id = ref.get("tool_id")
             field = ref.get("field", "")
             value = ref.get("value")
-            output = tool_results.get(tool)
-            if output is None:
-                violations.append("claim[%d] 引用未调用的工具 %s" % (idx, tool))
+            if not tool_id:
+                violations.append("claim[%d] evidence_ref 缺少 tool_id" % idx)
                 continue
-            if not output.get("success"):
-                violations.append("claim[%d] 引用了失败工具 %s" % (idx, tool))
+            evidence = evidence_by_id.get(tool_id)
+            if evidence is None:
+                violations.append("claim[%d] 引用不存在或不属于当前会话的 tool_id=%s"
+                                  % (idx, tool_id))
                 continue
+            tool = evidence.get("tool", "unknown")
+            if not evidence.get("success"):
+                violations.append("claim[%d] 引用了失败调用 %s(tool_id=%s)"
+                                  % (idx, tool, tool_id))
+                continue
+            output = evidence.get("output", {})
             actual, found = _resolve_field(output, field)
             if not found:
-                violations.append("claim[%d] 字段 %s.%s 不存在于工具输出" % (idx, tool, field))
+                violations.append("claim[%d] 字段 %s.%s 不存在于 tool_id=%s 的输出"
+                                  % (idx, tool, field, tool_id))
                 continue
             if not _values_match(value, actual):
-                violations.append("claim[%d] %s.%s 值不符：引用 %r 实际 %r"
-                                   % (idx, tool, field, value, actual))
+                violations.append("claim[%d] %s.%s(tool_id=%s) 值不符：引用 %r 实际 %r"
+                                  % (idx, tool, field, tool_id, value, actual))
+    return violations
+
+
+def verify_citations(
+    diagnosis: Dict,
+    recent_evidence: List[Dict],
+    thread_id: str,
+) -> Tuple[bool, List[str]]:
+    """只校验引用真实性，不判断证据是否充分或诊断推理是否成立。
+
+    返回 (all_grounded, violations)。violations 为人类可读的失败原因，供 diagnose 修正引用。
+    无 claims / 无关键证据属于推理充分性问题，由 reflect 负责。
+    """
+    claims = diagnosis.get("claims", []) or []
+    refs = [ref for claim in claims for ref in (claim.get("evidence_refs", []) or [])]
+    evidence_by_id = resolve_evidence_refs(refs, recent_evidence, thread_id)
+    violations = _citation_violations(claims, evidence_by_id)
 
     return (len(violations) == 0), violations
 
 
-def key_evidence_present(tool_results: Dict) -> bool:
-    """护栏 6 前置：是否具备下结论的关键证据（至少 PACS 目标查询成功）。"""
-    pacs = tool_results.get("query_pacs_target", {})
-    return bool(pacs.get("success"))
+def filter_grounded_claims(
+    diagnosis: Dict,
+    recent_evidence: List[Dict],
+    thread_id: str,
+) -> List[Dict]:
+    """只保留全部引用均真实的 claims，供 Verify 最终弃权时清理造假内容。"""
+    claims = diagnosis.get("claims", []) or []
+    refs = [ref for claim in claims for ref in (claim.get("evidence_refs", []) or [])]
+    evidence_by_id = resolve_evidence_refs(refs, recent_evidence, thread_id)
+    return [claim for claim in claims if not _citation_violations([claim], evidence_by_id)]
+
+
+def build_citation_facts(
+    diagnosis: Dict,
+    recent_evidence: List[Dict],
+    thread_id: str,
+) -> List[Dict]:
+    """为 reflect 构造全部已引用事实，包含已离开 State 窗口的 MySQL 证据。"""
+    claims = diagnosis.get("claims", []) or []
+    refs = [ref for claim in claims for ref in (claim.get("evidence_refs", []) or [])]
+    evidence_by_id = resolve_evidence_refs(refs, recent_evidence, thread_id)
+    facts: List[Dict] = []
+    for claim in claims:
+        for ref in claim.get("evidence_refs", []) or []:
+            evidence = evidence_by_id.get(ref.get("tool_id"))
+            if not evidence:
+                continue
+            actual, found = _resolve_field(evidence.get("output", {}), ref.get("field", ""))
+            if not found:
+                continue
+            facts.append({
+                "claim": claim.get("claim", ""),
+                "tool_id": evidence["tool_id"],
+                "tool": evidence.get("tool"),
+                "args": evidence.get("args", {}),
+                "field": ref.get("field", ""),
+                "value": actual,
+            })
+    return facts

@@ -7,6 +7,9 @@ import logging
 import re
 from typing import Dict, Optional
 
+from langchain_core.messages import AIMessage, HumanMessage
+
+from app.agent.rag.pipeline import search_knowledge
 from app.agent.state import AgentState
 from app.core.database import session_scope
 from app.core.enums import DataLevel
@@ -35,24 +38,39 @@ def _extract(pattern, text: str) -> Optional[str]:
 _VALID_ROUTES = {"diagnosis", "knowledge_qa", "clarification"}
 
 
-def parse_with_llm(message: str) -> Optional[Dict]:
+def parse_with_llm(message: str, context: str = "") -> Optional[Dict]:
     """规则抽不出标识时的 LLM 兜底：意图识别 + 实体抽取，产出结构化路由字段。
 
     返回 None 表示 LLM 不可用/调用失败，交由 route_request 落到规则澄清出口
     （与 plan_tools / retrieve_and_explain 同款 Fallback 纪律，绝不阻断图）。
     抽取的标识必须能在原文中找到（子串校验），否则视为幻觉丢弃。
     """
-    from app.agent.llm import get_structured_model, llm_available
+    from app.agent.llm import get_structured_model, llm_available, stable_prompt
 
     if not llm_available():
         return None
 
     try:
-        from app.agent.prompts import ROUTING_SYSTEM_PROMPT
+        from app.agent.prompts import get_system_prompt, xml_blocks
         from app.agent.tool_schemas import RouteDecision
 
-        model = get_structured_model(RouteDecision)
-        decision = model.invoke(ROUTING_SYSTEM_PROMPT + "\n\n## 用户消息\n" + message)
+        model = get_structured_model(RouteDecision, include_raw=True)
+        response = model.invoke(stable_prompt(
+            get_system_prompt("routing"),
+            xml_blocks([
+                ("conversation_summary", context),
+                ("user_message", message),
+            ]),
+        ))
+        if isinstance(response, dict) and "parsed" in response:
+            if response.get("parsing_error"):
+                raise response["parsing_error"]
+            decision = response.get("parsed")
+            if decision is None:
+                raise ValueError("routing structured response has no parsed value")
+            raw_messages = [response["raw"]] if isinstance(response.get("raw"), AIMessage) else []
+        else:
+            decision, raw_messages = response, []
     except Exception as exc:  # noqa: BLE001
         logger.warning("parse_with_llm LLM 调用失败，退回规则澄清: %s", exc)
         return None
@@ -60,7 +78,7 @@ def parse_with_llm(message: str) -> Optional[Dict]:
     route = decision.route if decision.route in _VALID_ROUTES else "clarification"
 
     if route != "diagnosis":
-        patch = {"route": route, "parse_source": "llm"}
+        patch = {"route": route, "parse_source": "llm", "messages": raw_messages}
         if route == "clarification":
             patch["clarification"] = (
                 decision.clarification
@@ -69,7 +87,7 @@ def parse_with_llm(message: str) -> Optional[Dict]:
         return patch
 
     # diagnosis：逐个标识做原文子串校验，过滤模型编造的 UID / task_id。
-    patch: Dict = {"route": "diagnosis", "parse_source": "llm"}
+    patch: Dict = {"route": "diagnosis", "parse_source": "llm", "messages": raw_messages}
     for field in ("task_id", "study_instance_uid", "series_instance_uid"):
         value = getattr(decision, field, None)
         if value and value in message:
@@ -80,6 +98,7 @@ def parse_with_llm(message: str) -> Optional[Dict]:
         return {
             "route": "clarification",
             "parse_source": "llm",
+            "messages": raw_messages,
             "clarification": decision.clarification
             or "请提供 task_id 或 StudyInstanceUID / SeriesInstanceUID 以便定位诊断对象。",
         }
@@ -100,7 +119,7 @@ def _pull_vs_diagnosis(message: str) -> Optional[str]:
     return None
 
 
-def route_request(state: AgentState) -> Dict:
+def _classify_request(state: AgentState) -> Dict:
     """分流 first_pull / diagnosis / knowledge_qa / clarification。
 
     三级纪律：显式意图字段 > 规则 > LLM 兜底（plan-autonomous-v2 §1.2）。
@@ -147,7 +166,7 @@ def route_request(state: AgentState) -> Dict:
 
     # 3) 规则全部落空且有文本 → LLM 意图识别 + 实体抽取（模糊自然语言兜底）。
     if message.strip():
-        llm_patch = parse_with_llm(message)
+        llm_patch = parse_with_llm(message, state.get("conversation_context", ""))
         if llm_patch is not None:
             return llm_patch
 
@@ -157,6 +176,17 @@ def route_request(state: AgentState) -> Dict:
         "parse_source": "rule",
         "clarification": "请提供 task_id 或 StudyInstanceUID / SeriesInstanceUID 以便定位诊断对象。",
     }
+
+
+def route_request(state: AgentState) -> Dict:
+    """分类请求并显式决定是否进入 RAG。
+
+    只有 knowledge_qa 意图启用 RAG；诊断、首次拉取和澄清请求不会把每条用户消息
+    自动送入知识库。search_knowledge 仍可作为统一工具暴露给外部调用者。
+    """
+    patch = _classify_request(state)
+    patch["use_rag"] = patch.get("route") == "knowledge_qa"
+    return patch
 
 
 def resolve_target(state: AgentState) -> Dict:
@@ -232,24 +262,69 @@ def present_clarification(state: AgentState) -> Dict:
 
 
 def retrieve_and_answer(state: AgentState) -> Dict:
-    """知识问答出口：Agentic RAG 检索知识库回答（spec §8）。检索不可用时明确提示。"""
-    message = state.get("message", "")
-    retrieved = []
-    try:
-        from app.agent.rag import retriever
-        from app.agent.rag.embeddings import embeddings_available
+    """知识问答出口：只消费统一检索结果并生成回答，不实现检索策略。"""
+    if state.get("use_rag") is not True:
+        raise RuntimeError("RAG is only available for knowledge_qa intent")
+    message = state["message"]
+    # Rewrite 只取用户可见、可控的最小上下文；State 标识不做 DB/PACS 验证。
+    recent_user_messages = [
+        item.content for item in state.get("messages", [])
+        if isinstance(item, HumanMessage) and isinstance(item.content, str)
+    ][-3:]
+    result = search_knowledge(
+        message,
+        context=(state.get("context_summary") or "")[:1000],
+        recent_user_messages=recent_user_messages,
+        task_id=state.get("task_id"),
+        study_instance_uid=state.get("study_instance_uid"),
+        series_instance_uid=state.get("series_instance_uid"),
+    )
+    retrieved = [hit.model_dump() for hit in result.hits]
+    sources = []
+    for index, hit in enumerate(result.hits, start=1):
+        sources.append({
+            "id": "S%d" % index,
+            "chunk_id": hit.chunk_id,
+            "title": hit.title,
+            "section": hit.section,
+            "page": hit.page,
+            "url": hit.url,
+        })
 
-        if embeddings_available():
-            retrieved = retriever.retrieve_texts(message)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("knowledge_qa 检索失败: %s", exc)
-
-    if retrieved:
-        summary = "根据知识库检索到以下相关内容：\n" + "\n---\n".join(retrieved)
+    if not result.hits:
+        summary = "知识库中没有检索到足够依据，暂时无法回答这个问题。"
     else:
-        summary = "知识库暂不可用或未检索到相关内容（需配置 embedding key 并初始化知识库）。"
+        documents = []
+        for index, hit in enumerate(result.hits, start=1):
+            location = "；".join(filter(None, [
+                hit.title,
+                hit.section,
+                "第%d页" % hit.page if hit.page is not None else None,
+            ]))
+            documents.append(("document", hit.content, {
+                "source_id": "S%d" % index,
+                "location": location,
+            }))
+        from app.agent.llm import get_chat_model, stable_prompt
+        from app.agent.prompts import get_system_prompt, xml_block
+
+        retrieved_context = "\n".join(
+            xml_block(name, content, attributes=attributes)
+            for name, content, attributes in documents
+        )
+        prompt = xml_block("user_query", message) + "\n\n<retrieved_context>\n" + retrieved_context + "\n</retrieved_context>"
+        response = get_chat_model().invoke(stable_prompt(get_system_prompt("rag_answer"), prompt))
+        if not isinstance(response.content, str) or not response.content.strip():
+            raise ValueError("knowledge answer response must be non-empty text")
+        summary = response.content.strip()
     return {
         "status": "completed",
-        "diagnosis": {"summary": summary, "route": "knowledge_qa", "retrieved_knowledge": retrieved},
+        "diagnosis": {
+            "summary": summary,
+            "route": "knowledge_qa",
+            "retrieved_knowledge": retrieved,
+            "sources": sources,
+            "rag": result.model_dump(),
+        },
         "retrieved_knowledge": retrieved,
     }

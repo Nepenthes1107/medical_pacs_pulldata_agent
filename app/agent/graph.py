@@ -1,21 +1,19 @@
-"""自主诊断主干图（plan §3 / spec §3）：reason ↔ act ↔ observe 循环 + 收束。
+"""自主诊断主干图：ReAct + 确定性 Observe 校验 + 有限终局修正。
 
 拓扑：
     START → route_request ─(knowledge_qa)→ retrieve_and_answer → END
                           ─(clarification)→ present_clarification → END
-                          ─(diagnosis)────→ resolve_target ─(clarification)→ present_clarification
-                                                            └(ok)→ reason ⇄ act → observe → reason
-                                                                       │(should_continue=diagnose)
-                                                                       ▼
-                                                                   diagnose → END
-
-Stage B：reason/diagnose 为规则占位，仅跑通拓扑与终止条件。
-后续阶段接 reflect / plan_repull / human_approval（Stage D/E）。
+                          ─(diagnosis)────→ resolve_target → reason → act → observe
+                                                              ↑        │       ├─ retry → act
+                                                              └────────┘       └─ validate → reason
+                                                              ↓
+                                     diagnose → verify → reflect ─(首次 unsupported)→ reason
+                                                          └→ plan_repull → approval → execute
 """
 import logging
-import os
 from typing import Optional
 
+from app.agent.context import capture_response, manage_context, new_user_message
 from app.agent.nodes.approval import execute, human_approval, route_after_approval
 from app.agent.nodes.first_pull import first_pull
 from app.agent.nodes.loop import (
@@ -25,6 +23,8 @@ from app.agent.nodes.loop import (
     plan_repull,
     reason,
     reflect,
+    route_after_observe,
+    route_after_reflect,
     route_after_verify,
     should_continue,
     verify_diagnosis,
@@ -35,8 +35,8 @@ from app.agent.nodes.routing import (
     retrieve_and_answer,
     route_request,
 )
-from app.agent.state import DEFAULT_MAX_ITERATIONS, AgentState
-from app.core.config import resolve_project_path, settings
+from app.agent.state import AgentState
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ def _route_after_resolve(state: AgentState) -> str:
 
 
 def build_graph(checkpointer=None):
-    """构造并编译自主诊断循环图。checkpointer 可注入（默认 SqliteSaver 单实例）。"""
+    """构造并编译自主诊断循环图。生产运行注入 Redis Checkpointer。"""
     from langgraph.graph import END, START, StateGraph
 
     # 配置 LangSmith tracing 开关（可观测层）；不可用不影响主流程（护栏 7 旁路）。
@@ -72,6 +72,8 @@ def build_graph(checkpointer=None):
         pass
 
     graph = StateGraph(AgentState)
+    graph.add_node("manage_context", manage_context)
+    graph.add_node("capture_response", capture_response)
     graph.add_node("route_request", route_request)
     graph.add_node("resolve_target", resolve_target)
     graph.add_node("first_pull", first_pull)
@@ -87,7 +89,8 @@ def build_graph(checkpointer=None):
     graph.add_node("human_approval", human_approval)  # 护栏 4：interrupt 暂停等人工审批
     graph.add_node("execute", execute)  # 审批通过后执行写操作（固定节点，调图外写工具）
 
-    graph.add_edge(START, "route_request")
+    graph.add_edge(START, "manage_context")
+    graph.add_edge("manage_context", "route_request")
     graph.add_conditional_edges(
         "route_request",
         _route_after_request,
@@ -103,52 +106,58 @@ def build_graph(checkpointer=None):
         _route_after_resolve,
         {"reason": "reason", "present_clarification": "present_clarification"},
     )
-    # 循环核心：reason ─(should_continue)→ act / diagnose；act → observe → reason。
+    # 循环核心：reason 决策；observe 确定性决定重试、继续推理或无进展收束。
     graph.add_conditional_edges(
         "reason",
         should_continue,
         {"act": "act", "diagnose": "diagnose"},
     )
     graph.add_edge("act", "observe")
-    graph.add_edge("observe", "reason")
+    graph.add_conditional_edges(
+        "observe",
+        route_after_observe,
+        {"act": "act", "reason": "reason", "diagnose": "diagnose"},
+    )
 
-    # 终局收束：diagnose → 引用接地校验（护栏 2）→ 打回重述 or 反思（护栏 7）→ END。
+    # 终局收束：Verify 修正虚假引用；首次业务性 unsupported Reflection 可回 Reason 补证一次。
     graph.add_edge("diagnose", "verify_diagnosis")
     graph.add_conditional_edges(
         "verify_diagnosis",
         route_after_verify,
         {"diagnose": "diagnose", "reflect": "reflect"},
     )
-    graph.add_edge("reflect", "plan_repull")
+    graph.add_conditional_edges(
+        "reflect",
+        route_after_reflect,
+        {"reason": "reason", "plan_repull": "plan_repull"},
+    )
     # 补拉计划 → 人工审批闸门（interrupt 暂停）→ approved 执行写 / 否则收尾（护栏 4）。
     graph.add_edge("plan_repull", "human_approval")
     graph.add_conditional_edges(
         "human_approval",
         route_after_approval,
-        {"execute": "execute", "__end__": END},
+        {"execute": "execute", "__end__": "capture_response"},
     )
-    graph.add_edge("execute", END)
-    graph.add_edge("first_pull", END)  # 首拉直达出口，不进循环（plan-v2 §1.3）
-    graph.add_edge("present_clarification", END)
-    graph.add_edge("retrieve_and_answer", END)
+    graph.add_edge("execute", "capture_response")
+    graph.add_edge("first_pull", "capture_response")  # 首拉直达出口，不进循环（plan-v2 §1.3）
+    graph.add_edge("present_clarification", "capture_response")
+    graph.add_edge("retrieve_and_answer", "capture_response")
+    graph.add_edge("capture_response", END)
 
     return graph.compile(checkpointer=checkpointer)
 
 
 def _default_checkpointer():
-    """SqliteSaver（单实例简历项目）。失败时返回 None。
+    """创建 Redis Checkpointer，并初始化所需索引。"""
+    from langgraph.checkpoint.redis import RedisSaver
 
-    跨进程共享：API 进程创建 Run、worker 进程 interrupt 暂停、API 进程 resume，
-    三处靠同一 sqlite 文件 + check_same_thread=False 共享 checkpoint 状态。
-    """
-    from langgraph.checkpoint.sqlite import SqliteSaver
-
-    path = resolve_project_path(settings.agent.checkpoint_path)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    import sqlite3
-
-    conn = sqlite3.connect(path, check_same_thread=False)
-    return SqliteSaver(conn)
+    ttl = {
+        "default_ttl": settings.agent.checkpoint_ttl_minutes,
+        "refresh_on_read": True,
+    }
+    saver = RedisSaver.from_conn_string(settings.redis.url, ttl=ttl)
+    saver.setup()
+    return saver
 
 
 _CHECKPOINTER = None
@@ -174,52 +183,69 @@ def run_agent(
     series_instance_uid: Optional[str] = None,
     source_id: str = "orthanc-local",
     run_id: str = "adhoc",
+    thread_id: Optional[str] = None,
     checkpointer=None,
-    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_iterations: Optional[int] = None,
     intent: Optional[str] = None,
 ) -> dict:
     """执行自主诊断循环，返回最终 state。"""
     app = build_graph(checkpointer=checkpointer)
+    thread_id = thread_id or run_id
     initial = _initial_state(message, task_id, study_instance_uid, series_instance_uid,
-                             source_id, run_id, max_iterations, intent)
-    config = {"configurable": {"thread_id": run_id}} if checkpointer else {}
+                             source_id, run_id, thread_id, max_iterations, intent)
+    config = {"configurable": {"thread_id": thread_id}} if checkpointer else {}
     return app.invoke(initial, config=config)
 
 
 def _initial_state(message, task_id, study_instance_uid, series_instance_uid,
-                   source_id, run_id, max_iterations, intent) -> AgentState:
-    return {
+                   source_id, run_id, thread_id, max_iterations, intent) -> AgentState:
+    max_iterations = max_iterations or settings.agent.max_agent_steps
+    state: AgentState = {
         "run_id": run_id,
+        "thread_id": thread_id,
         "status": "running",
         "message": message,
+        "messages": [new_user_message(message)],
         "intent": intent,
-        "task_id": task_id,
         "source_id": source_id,
-        "study_instance_uid": study_instance_uid,
-        "series_instance_uid": series_instance_uid,
         "diagnostic_level": "unknown",
         "iteration": 0,
         "max_iterations": max_iterations,
         "tool_call_history": [],
         "pending_tool_calls": [],
+        "tool_retry_counts": {},
+        "action_observations": [],
+        "rule_findings": [],
         "converged": False,
         "evidence": [],
         "tool_results": {},
+        "last_tool_ids": [],
         "diagnose_attempts": 0,
         "citation_ok": False,
         "errors": [],
-        # 同一 run_id 复用同一 checkpoint thread：显式清空上一轮周期状态，
+        # 同一 thread_id 开启新一轮时显式清空周期状态；messages/summary 由 reducer 与 checkpoint 延续，
         # 否则未在本次 input 中出现的旧字段会沿用 checkpoint 里的历史值（状态泄漏）。
         "diagnosis": None,
         "reflection": None,
+        "reflection_attempts": 0,
         "repull_plan": None,
         "approval_status": None,
         "operator": None,
         "action_result": None,
         "stop_reason": None,
-        "hypothesis": None,
         "citation_violations": [],
+        "clarification": None,
+        "retrieved_knowledge": [],
     }
+    # 仅携带 thread_id 的追问应沿用 checkpoint 中的诊断目标；显式传入任一新目标时，
+    # 才整体替换旧目标，防止新 task 与上一轮 Study/Series 混合。
+    if task_id is not None or study_instance_uid is not None or series_instance_uid is not None:
+        state.update({
+            "task_id": task_id,
+            "study_instance_uid": study_instance_uid,
+            "series_instance_uid": series_instance_uid,
+        })
+    return state
 
 
 def run_agent_streaming(
@@ -229,8 +255,9 @@ def run_agent_streaming(
     series_instance_uid: Optional[str] = None,
     source_id: str = "orthanc-local",
     run_id: str = "adhoc",
+    thread_id: Optional[str] = None,
     checkpointer=None,
-    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_iterations: Optional[int] = None,
     intent: Optional[str] = None,
 ) -> dict:
     """流式执行：逐节点拿 state 增量 → 发过程事件 → 聚合出最终 state。
@@ -242,12 +269,14 @@ def run_agent_streaming(
     from app.agent.llm import llm_available
 
     app = build_graph(checkpointer=checkpointer)
+    thread_id = thread_id or run_id
     initial = _initial_state(message, task_id, study_instance_uid, series_instance_uid,
-                             source_id, run_id, max_iterations, intent)
-    config = {"configurable": {"thread_id": run_id}}
+                             source_id, run_id, thread_id, max_iterations, intent)
+    config = {"configurable": {"thread_id": thread_id}}
     degraded = not llm_available()
 
     merged: dict = dict(initial)
+    interrupted = False
     try:
         for chunk in app.stream(initial, config=config, stream_mode="updates"):
             # chunk: {node_name: state_update}；interrupt 时为 {"__interrupt__": (Interrupt,...)}。
@@ -256,15 +285,26 @@ def run_agent_streaming(
                     # 图在 human_approval 暂停等人工（护栏 4）。checkpoint 已存暂停态，
                     # 等 API 侧 Command(resume) 恢复。此处标 awaiting_approval 供落库。
                     merged["status"] = "awaiting_approval"
+                    interrupted = True
                     ev.publish_event(run_id, {"type": "node", "node": "human_approval",
                                               "awaiting_approval": True, "degraded": degraded})
                     continue
                 if isinstance(update, dict):
                     merged.update(update)
+                    from app.agent.audit import record_execution_event
+
+                    record_execution_event(run_id, thread_id, node_name, update)
                     event = ev.node_to_event(node_name, update, degraded=degraded)
                     if event:
                         ev.publish_event(run_id, event)
     finally:
+        # updates 流只包含本轮节点增量；多轮恢复时，以 Checkpointer 中的完整快照补齐
+        # 本轮未重写的历史字段（例如仅凭 thread_id 继承的诊断目标）。
+        snapshot = app.get_state(config)
+        if snapshot and snapshot.values:
+            merged = dict(snapshot.values)
+        if interrupted:
+            merged["status"] = "awaiting_approval"
         # awaiting_approval 是 interrupt 暂停，不是终态——mark_done 会让 SSE 提前挂 done，
         # 断掉后续 execute/awaiting_repull 这段用户还要看的过程。真正终态才收尾。
         if merged.get("status") != "awaiting_approval":
@@ -272,11 +312,16 @@ def run_agent_streaming(
     return merged
 
 
-def resume_after_approval(run_id: str, action: str, operator: Optional[str] = None) -> dict:
+def resume_after_approval(
+    run_id: str,
+    thread_id: str,
+    action: str,
+    operator: Optional[str] = None,
+) -> dict:
     """审批恢复（HITL replay）：用 Command(resume) 从 human_approval 暂停处继续图执行。
 
     approve → 图内 execute 节点执行写操作后到 END；reject → human_approval 直接到 END。
-    必须用与暂停时同一个 checkpointer + thread_id=run_id 才能恢复暂停态。
+    必须用与暂停时同一个 checkpointer + thread_id 才能恢复暂停态。
     返回恢复后跑完的最终 state（含 approval_status / action_result / status）。
 
     补发过程事件（同一条 SSE 流延续，不需要前端知道要重连）：审批结果本身 + execute
@@ -290,8 +335,21 @@ def resume_after_approval(run_id: str, action: str, operator: Optional[str] = No
 
     checkpointer = get_checkpointer()
     app = build_graph(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": run_id}}
+    config = {"configurable": {"thread_id": thread_id}}
     result = app.invoke(Command(resume={"action": action, "operator": operator}), config=config)
+
+    from app.agent.audit import record_execution_event
+
+    record_execution_event(run_id, thread_id, "human_approval", {
+        "action": action,
+        "operator": operator,
+        "approval_status": result.get("approval_status"),
+    })
+    if result.get("action_result"):
+        record_execution_event(run_id, thread_id, "execute", {
+            "action_result": result["action_result"],
+            "status": result.get("status"),
+        })
 
     ev.publish_event(run_id, {"type": "node", "node": "human_approval", "resumed": True,
                               "action": action, "approval_status": result.get("approval_status")})

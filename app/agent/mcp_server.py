@@ -10,6 +10,7 @@
 import logging
 from typing import Optional
 
+from app.agent.rag.pipeline import search_knowledge
 from app.agent.tools import (
     READ_ONLY_TOOL_NAMES,
     compute_integrity,
@@ -20,7 +21,6 @@ from app.agent.tools import (
     query_task_context,
     query_task_history,
     query_worker_health,
-    search_knowledge,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,14 +104,8 @@ def build_mcp_server():
         """完整性算术：给定 expected 与 local_unique_sop 返回缺口。"""
         return compute_integrity(expected, local_unique_sop, level).model_dump()
 
-    @mcp.tool()
-    def mcp_search_knowledge(
-        query: str,
-        category: Optional[str] = None,
-        top_n: Optional[int] = None,
-    ) -> dict:
-        """按需检索领域知识/故障 SOP/历史经验。"""
-        return search_knowledge(query, category, top_n).model_dump()
+    # RAG 不设 MCP 转发函数：MCP 与 StructuredTool 绑定同一个函数对象和输出模型。
+    mcp.tool()(search_knowledge)
 
     return mcp
 

@@ -40,11 +40,15 @@ def process_message(body: bytes) -> None:
 def _begin_downloading(task_id: str):
     """短事务：标记 downloading + download_started_at，返回 C-MOVE 所需参数。"""
     with session_scope() as db:
-        task = db.query(DownloadTask).filter(DownloadTask.task_id == task_id).first()
+        task = (db.query(DownloadTask)
+                .filter(DownloadTask.task_id == task_id)
+                .with_for_update()
+                .first())
         if not task:
             raise RuntimeError("task not found: %s" % task_id)
-        if task.status == DownloadStatus.CANCEL.value:
-            logger.info("skip canceled task: %s", task_id)
+        # RabbitMQ 至少一次投递：只有 in_queue 能领取，其他状态说明已被领取或已终结。
+        if task.status != DownloadStatus.IN_QUEUE.value:
+            logger.info("skip duplicate/stale task message: %s status=%s", task_id, task.status)
             return None
         # L1 止损闸门：C-MOVE 尚未发起，此时止损 100% 有效（一张影像都不会被推过来）。
         if abort.is_task_aborted(task_id):

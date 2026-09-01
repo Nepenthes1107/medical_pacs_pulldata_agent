@@ -11,6 +11,7 @@ POST /agent/runs/{run_id}/cancel → 只释放 thread，已投递的补拉照常
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
@@ -43,13 +44,15 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 
 # 「活跃」状态集：这些状态下 thread 被占用，同 thread 新请求需拒绝。
 ACTIVE_STATUSES = ("running", "awaiting_approval", "awaiting_repull")
+THREAD_ID_CONFLICT_DETAIL = "thread_id 已被占用，请使用新的 thread_id 重试"
 
 
 @router.post("/chat", response_model=ChatResponse, status_code=status.HTTP_202_ACCEPTED)
 def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
     """创建 Run 并异步执行，立即返回 202 + run_id。
 
-    需求 2：同一 thread 同一时刻只允许一个活跃 Run。已有活跃 Run → 409 + 活跃 run_id。
+    需求 2：同一 thread 同一时刻只允许一个活跃 Run。已有活跃 Run → 409，客户端必须
+    生成新的 thread_id 后重试，不能等待后继续复用冲突 ID。
     查-建之间用 Redis 短锁防并发同 thread 各建一个（复用 execute_repull_plan 的锁思路）。
     """
     if not request.message and not (
@@ -57,30 +60,29 @@ def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
     ):
         raise HTTPException(status_code=400, detail="message is required")
 
-    thread_id = request.thread_id
+    # 未显式传入时创建新会话；调用方后续复用响应中的 thread_id 即可恢复 State。
+    thread_id = request.thread_id or str(uuid4())
     lock_token = None
     if thread_id:
         # 1) 先查已有活跃 Run（快速拒绝，不必先拿锁）。
         active = _active_run_for_thread(db, thread_id)
         if active:
-            raise HTTPException(status_code=409,
-                                detail={"message": "本会话有任务进行中", "active_run_id": active.run_id})
+            raise HTTPException(status_code=409, detail=THREAD_ID_CONFLICT_DETAIL)
         # 2) 拿 Redis 短锁，防查-建竞态；拿不到说明并发请求正在建 → 409。
         lock_token = _acquire_thread_lock(thread_id)
         if lock_token is None:
-            raise HTTPException(status_code=409, detail={"message": "本会话有任务正在创建"})
+            raise HTTPException(status_code=409, detail=THREAD_ID_CONFLICT_DETAIL)
 
     try:
         # 3) 锁内二次确认（双检，防第一步查空后另一请求已建）。
         if thread_id:
             active = _active_run_for_thread(db, thread_id)
             if active:
-                raise HTTPException(status_code=409,
-                                    detail={"message": "本会话有任务进行中", "active_run_id": active.run_id})
+                raise HTTPException(status_code=409, detail=THREAD_ID_CONFLICT_DETAIL)
         run_id = str(uuid4())
         run = AgentRun(
             run_id=run_id, status="running", message=request.message, intent=request.intent,
-            thread_id=thread_id, user_id=request.user_id,
+            thread_id=thread_id, user_id=request.user_id, source_id=request.source_id,
             task_id=request.task_id, study_instance_uid=request.study_instance_uid,
             series_instance_uid=request.series_instance_uid,
         )
@@ -93,7 +95,7 @@ def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
             run.error = "agent_runs publish failed: %s" % exc
             db.commit()
             raise HTTPException(status_code=503, detail=run.error)
-        return ChatResponse(run_id=run_id, status="running")
+        return ChatResponse(run_id=run_id, thread_id=thread_id, status="running")
     finally:
         # Run 已落库，活跃判定接手串行控制，短锁可提前释放（活跃判定基于 status，天然释放）。
         if lock_token is not None:
@@ -229,7 +231,9 @@ def run_action(run_id: str, request: ActionRequest, db: Session = Depends(get_db
     # 审批 = 从图的 human_approval 暂停处 Command(resume) 恢复。
     # approve → 图内 execute 节点执行写操作；reject → 图内直接收尾。写操作只发生在图内固定节点。
     try:
-        result_state = resume_after_approval(run_id, action, request.operator)
+        result_state = resume_after_approval(
+            run_id, run.thread_id or run_id, action, request.operator
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("审批恢复失败: %s", run_id)
         raise HTTPException(status_code=500, detail="approval resume failed: %s" % exc)
@@ -287,6 +291,19 @@ def abort_run(run_id: str, request: AbortRequest = AbortRequest(), db: Session =
     # 止损范围：定向补拉只停点名的 Series，避免误伤同 Study 的其他正常数据。
     series_uids, previous_status = _abort_scope(db, task_id)
     flag_set = abort_service.mark_aborted(task_id, run.study_instance_uid, series_uids)
+
+    # MySQL 是任务是否允许启动的权威来源；Redis 标记只负责打断已开始的热路径。
+    task = db.query(DownloadTask).filter(DownloadTask.task_id == task_id).first()
+    if task and task.status not in (
+        DownloadStatus.SUCCESS.value,
+        DownloadStatus.FAIL.value,
+        DownloadStatus.UNVERIFIED.value,
+        DownloadStatus.CANCEL.value,
+    ):
+        task.status = DownloadStatus.CANCEL.value
+        task.last_error = "aborted by operator"
+        task.checked_at = datetime.utcnow()
+        task.failed_at = datetime.utcnow()
 
     # Run 落 aborted 终态：离开活跃态即释放 thread，也让补拉失败事件不再接管（同 /cancel 机制）。
     run.status = "aborted"

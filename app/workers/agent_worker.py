@@ -36,6 +36,7 @@ def process_run(run_id: str) -> None:
         study_uid = run.study_instance_uid
         series_uid = run.series_instance_uid
         source_id = _source_id_of(run)
+        thread_id = run.thread_id or run.run_id
 
     # checkpointer 是 HITL 审批 interrupt/replay 的前提（护栏 4）。初始化失败不静默降级——
     # 否则审批闸门失效，直接把 Run 标 failed 并注明（降级不伪装）。
@@ -57,10 +58,13 @@ def process_run(run_id: str) -> None:
         state = run_agent_streaming(
             message=message, task_id=task_id, study_instance_uid=study_uid,
             series_instance_uid=series_uid, source_id=source_id, run_id=run_id,
-            intent=intent, checkpointer=checkpointer,
+            thread_id=thread_id, intent=intent, checkpointer=checkpointer,
         )
     except Exception as exc:
         logger.exception("agent run failed: %s", run_id)
+        from app.agent.audit import record_exception
+
+        record_exception(run_id, thread_id, exc)
         with session_scope() as db:
             run = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
             if run:
@@ -72,7 +76,7 @@ def process_run(run_id: str) -> None:
 
 
 def _source_id_of(run: AgentRun) -> str:
-    return "orthanc-local"
+    return run.source_id or "orthanc-local"
 
 
 def _persist_result(run_id: str, state: dict) -> None:
@@ -140,6 +144,7 @@ def process_repull_failure(task_id: str, terminal_status: str, failure_stage: st
         study_uid = run.study_instance_uid
         series_uid = run.series_instance_uid
         source_id = _source_id_of(run)
+        thread_id = run.thread_id or run.run_id
         # 状态先移出 awaiting_repull，防止重复失败消息或并发取消互相覆盖（幂等要求）。
         run.status = "running"
         run.proposed_action = None
@@ -174,10 +179,13 @@ def process_repull_failure(task_id: str, terminal_status: str, failure_stage: st
         state = run_agent_streaming(
             message=message, task_id=task_id, study_instance_uid=study_uid,
             series_instance_uid=series_uid, source_id=source_id, run_id=run_id,
-            intent="diagnosis", checkpointer=checkpointer,
+            thread_id=thread_id, intent="diagnosis", checkpointer=checkpointer,
         )
     except Exception as exc:
         logger.exception("重新诊断失败: %s", run_id)
+        from app.agent.audit import record_exception
+
+        record_exception(run_id, thread_id, exc)
         with session_scope() as db:
             run = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
             if run:
