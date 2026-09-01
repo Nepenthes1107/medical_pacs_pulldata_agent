@@ -115,6 +115,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     run_id: str
+    thread_id: str
     status: str
 
 

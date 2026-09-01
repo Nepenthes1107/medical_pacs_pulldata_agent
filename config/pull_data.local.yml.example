@@ -57,17 +57,26 @@ llm:
 
 rag:
   persist_dir: /app/data/chroma
+  source_dir: /app/data/rag/sources
+  lexical_index_dir: /app/data/rag/bm25
   embedding_model: text-embedding-v4
   embedding_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  enable_rerank: false
+  candidate_k: 20
+  rrf_constant: 60
   rerank_model: qwen3-rerank
-  top_k: 3
+  top_k: 5
 
 agent:
   agent_runs_queue: agent_runs
   approval_lock_ttl_seconds: 300
   max_few_shot: 3
-  checkpoint_path: /app/data/agent_checkpoints.sqlite
+  checkpoint_ttl_minutes: 1440
+  context_token_budget: 12000
+  context_summary_budget: 2000
+  recent_message_count: 8
+  max_agent_steps: 8
+  tool_max_retries: 1
+  max_reflection_revisions: 1
 
 # LANGSMITH_API_KEY 走环境变量；这里只放开关和 project 名。
 langsmith:

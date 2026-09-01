@@ -19,9 +19,17 @@ services:
       retries: 10
 
   redis:
-    image: redis:7
+    # Redis 8 内置 RedisJSON/RediSearch，满足 langgraph-checkpoint-redis 的索引要求。
+    image: redis:8
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   rabbitmq:
     image: rabbitmq:3-management
@@ -62,7 +70,7 @@ services:
       mysql:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
       rabbitmq:
         condition: service_started
 
@@ -83,7 +91,7 @@ services:
       mysql:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
 
   pull-data-worker:
     build: .
@@ -97,6 +105,8 @@ services:
       - ./data/fileserver:/app/data/fileserver
       - ./config:/app/config:ro
     depends_on:
+      redis:
+        condition: service_healthy
       mysql:
         condition: service_healthy
       rabbitmq:
@@ -118,6 +128,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
 
   agent-worker:
     build: .
@@ -135,16 +147,30 @@ services:
     volumes:
       - ./data/fileserver:/app/data/fileserver
       - ./data/chroma:/app/data/chroma
+      - ./data/rag:/app/data/rag
       - ./config:/app/config:ro
     depends_on:
       mysql:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
       rabbitmq:
         condition: service_started
 
+  rag-init:
+    build: .
+    command: python -m app.agent.rag.init_knowledge --download
+    environment:
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      FILESERVER_ROOT: /app/data/fileserver
+    volumes:
+      - ./data/chroma:/app/data/chroma
+      - ./data/rag:/app/data/rag
+      - ./config:/app/config:ro
+    profiles: ["init"]
+
 volumes:
   mysql_data:
+  redis_data:
   rabbitmq_data:
   orthanc_data:

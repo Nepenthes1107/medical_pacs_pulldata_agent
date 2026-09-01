@@ -74,11 +74,14 @@ class LLMConfig(BaseModel):
 
 class RAGConfig(BaseModel):
     persist_dir: str = "./data/chroma"
+    source_dir: str = "./data/rag/sources"
+    lexical_index_dir: str = "./data/rag/bm25"
     embedding_model: str = "text-embedding-v4"
     embedding_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    enable_rerank: bool = False
+    candidate_k: int = Field(20, ge=1)
+    rrf_constant: int = Field(60, ge=1)
     rerank_model: str = "qwen3-rerank"
-    top_k: int = 3
+    top_k: int = Field(5, ge=1, le=10)
 
 
 class AgentConfig(BaseModel):
@@ -91,8 +94,14 @@ class AgentConfig(BaseModel):
     # best-effort 发布失败或消费者长期不可用），不代表任何完整性判定——完整性只由 Checker 裁定。
     repull_terminal_timeout_seconds: int = 1800
     max_few_shot: int = 3
-    checkpoint_path: str = "./data/agent_checkpoints.sqlite"
+    checkpoint_ttl_minutes: int = 1440
+    context_token_budget: int = 12000
+    context_summary_budget: int = 2000
+    recent_message_count: int = 8
     act_max_workers: int = 4  # 单 run 内 act() 多个只读工具的并发上限（线程池）
+    max_agent_steps: int = 8
+    tool_max_retries: int = 1
+    max_reflection_revisions: int = 1
     # 紧急止损标记存活时长：必须长于 PACS 把一批 C-STORE 推完的时间，否则标记先过期、
     # 余下影像照常收下。1 小时覆盖大范围 Study 的推送窗口。
     abort_flag_ttl_seconds: int = 3600

@@ -27,5 +27,6 @@ class ArchiveStatus(str, Enum):
     ARCHIVING = "archiving"
     FINISHED = "finished"
     FAIL = "fail"
+    UNVERIFIED = "unverified"
 
 

@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS archive (
   study_instance_uid VARCHAR(128) NOT NULL,
   series_instance_uid VARCHAR(128) DEFAULT NULL,
   level VARCHAR(32) NOT NULL DEFAULT 'study_level',
-  status VARCHAR(32) NOT NULL DEFAULT 'unknown' COMMENT 'unknown / archiving / finished / fail',
+  status VARCHAR(32) NOT NULL DEFAULT 'unknown' COMMENT 'unknown / archiving / finished / fail / unverified',
   task_id VARCHAR(64) DEFAULT NULL,
   expected_image_count INT DEFAULT NULL,
   archived_image_count INT NOT NULL DEFAULT 0,
@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS agent_run (
   intent VARCHAR(32) DEFAULT NULL COMMENT '显式意图（first_pull 等），最高优先于规则/LLM',
   thread_id VARCHAR(64) DEFAULT NULL COMMENT '会话标识，同 thread 同一时刻只允许一个活跃 Run（需求 2）',
   user_id VARCHAR(64) DEFAULT NULL COMMENT '用户标识（多用户隔离）',
+  source_id VARCHAR(64) NOT NULL DEFAULT 'orthanc-local' COMMENT '本次 Agent Run 使用的 PACS source',
   status VARCHAR(32) NOT NULL DEFAULT 'running' COMMENT 'running / awaiting_approval / awaiting_repull / completed / failed / rejected / cancelled',
   message TEXT DEFAULT NULL COMMENT '用户输入的自然语言 message',
   task_id VARCHAR(64) DEFAULT NULL COMMENT '解析出的任务 ID',
@@ -149,6 +150,9 @@ CREATE TABLE IF NOT EXISTS agent_run (
   KEY idx_task_id (task_id),
   KEY idx_thread_id (thread_id),
   KEY idx_user_id (user_id),
+  KEY idx_source_id (source_id),
+  KEY idx_agent_run_thread_status_created (thread_id, status, created_at),
+  KEY idx_agent_run_task_status_created (task_id, status, created_at),
   KEY idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -158,12 +162,47 @@ CREATE TABLE IF NOT EXISTS agent_action_audit (
   task_id VARCHAR(64) NOT NULL COMMENT '被操作的补拉任务',
   action VARCHAR(32) NOT NULL COMMENT '写操作类型，如 retry_pull_task',
   operator VARCHAR(64) DEFAULT NULL COMMENT '审批人标识',
-  idempotency_key VARCHAR(128) DEFAULT NULL COMMENT 'run_id+task_id+action 派生的短期锁键',
-  result VARCHAR(32) NOT NULL COMMENT 'submitted / rejected / failed',
+  idempotency_key VARCHAR(128) NOT NULL COMMENT '目标+策略+范围派生的业务幂等键',
+  result VARCHAR(32) NOT NULL COMMENT 'processing / submitted / escalated / failed',
   detail JSON DEFAULT NULL COMMENT '执行结果摘要',
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
+  UNIQUE KEY uk_agent_action_idempotency (idempotency_key),
   KEY idx_run_id (run_id),
   KEY idx_task_id (task_id),
+  KEY idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS agent_execution_log (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  run_id VARCHAR(64) NOT NULL COMMENT '关联 agent_run.run_id',
+  thread_id VARCHAR(64) NOT NULL COMMENT 'LangGraph checkpoint 会话标识',
+  event_type VARCHAR(32) NOT NULL COMMENT 'node / tool_call / exception',
+  node_name VARCHAR(64) DEFAULT NULL,
+  payload JSON DEFAULT NULL COMMENT '轻量状态摘要与 tool_id 引用；不保存完整工具参数或输出',
+  error TEXT DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_run_id (run_id),
+  KEY idx_thread_id (thread_id),
+  KEY idx_event_type (event_type),
+  KEY idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS agent_tool_evidence (
+  id BIGINT NOT NULL AUTO_INCREMENT,
+  tool_id VARCHAR(36) NOT NULL COMMENT '单次工具调用的全局唯一标识，供 evidence_ref 精确引用',
+  run_id VARCHAR(64) NOT NULL COMMENT '产生证据的 Agent Run',
+  thread_id VARCHAR(64) NOT NULL COMMENT '证据所属会话，用于隔离查询',
+  tool_name VARCHAR(64) NOT NULL,
+  tool_args JSON NOT NULL COMMENT '该次调用的完整参数',
+  output JSON NOT NULL COMMENT '该次调用的完整结构化返回',
+  success TINYINT(1) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_tool_id (tool_id),
+  KEY idx_run_id (run_id),
+  KEY idx_thread_id (thread_id),
+  KEY idx_tool_name (tool_name),
   KEY idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

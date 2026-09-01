@@ -11,15 +11,22 @@ pydicom
 pynetdicom
 requests
 langgraph
+langgraph-checkpoint-redis
 langchain-core
 langchain-openai
 langsmith
-langgraph-checkpoint-sqlite
 langchain-text-splitters
 chromadb
+tiktoken
 python-dotenv
+PyMuPDF
+python-docx
+beautifulsoup4
+bm25s
+jieba
+dashscope
 
-# --- 可选：MCP 薄层（阶段 11，只暴露 4 个只读工具）---
+# --- 可选：MCP（只暴露只读工具；RAG 直接注册唯一 search_knowledge）---
 mcp
 
 # --- dev / test ---
