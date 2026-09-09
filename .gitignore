@@ -11,7 +11,8 @@ venv/
 data/
 
 # --- 本地配置（含敏感信息，仅 example 入库） ---
-config/pull_data.local.yml
+# 匹配任何 *.local.yml；*.example 文件不受影响，仍正常入库
+config/*.local.yml
 
 # --- 环境变量 ---
 .env
@@ -36,3 +37,20 @@ Thumbs.db
 *.egg-info/
 dist/
 build/
+
+# --- 覆盖率 / 静态检查产物 ---
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- 日志（本机/容器调试重定向） ---
+logs/
+*.log
+
+# --- Notebook 检查点 ---
+.ipynb_checkpoints/
+
+# --- Claude Code 本地设置（跨机器不同步，团队共享的 CLAUDE.md 仍入库） ---
+.claude/settings.local.json
