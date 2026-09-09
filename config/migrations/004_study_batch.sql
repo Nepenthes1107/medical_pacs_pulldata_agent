@@ -1,0 +1,5 @@
+ALTER TABLE agent_run
+  ADD COLUMN study_instance_uid_list JSON DEFAULT NULL,
+  ADD COLUMN batch_mode TINYINT(1) NOT NULL DEFAULT 0,
+  ADD COLUMN batch_summary JSON DEFAULT NULL,
+  ADD COLUMN study_results JSON DEFAULT NULL;

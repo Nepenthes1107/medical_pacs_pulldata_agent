@@ -168,6 +168,23 @@ def query_task_context(
         return TaskContextOutput(**_safe_failure("query_task_context", exc, "task query"))
 
 
+def _storescp_reachable() -> bool:
+    """TCP 探测 storescp 端口是否可连（接收端存活信号，2 秒超时）。
+
+    监听地址 0.0.0.0/:: 与回环无法用于主动连接，回退到 compose 服务名。
+    """
+    import socket
+
+    host = settings.storescp.host
+    if host in ("0.0.0.0", "::", "127.0.0.1", "localhost"):
+        host = "pull-data-storescp"
+    try:
+        with socket.create_connection((host, settings.storescp.port), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
 def query_receive_status(
     study_instance_uid: str,
     series_instance_uid: Optional[str] = None,
@@ -192,6 +209,7 @@ def query_receive_status(
         return ReceiveStatusOutput(
             success=True,
             result_status="empty" if nothing else "ok",
+            storescp_reachable=_storescp_reachable(),
             storescp_received_count=received_count,
             local_parsed_count=summary["total_files"],
             local_unique_sop_count=summary["total_sop_count"],
@@ -684,6 +702,22 @@ def _submit_repull(run_id, task_id, strategy, idempotency_key, operator, force):
                 degraded = True
                 note = "targeted_cmove degraded to full retry_task (no missing target provided)"
         task_level = task.level
+
+        # retry_task 重新 C-FIND 刷新 expected（保持同一 task_id、retry_times 连续累加）。
+        # 根因是「expected 配置错误/虚高」时，重查 PACS 才能得到正确期望数，避免重试死循环。
+        if strategy == "retry_task":
+            from app.services import pull as pull_service
+
+            try:
+                new_expected = pull_service.refresh_task_expected(task, db)
+                note = "refreshed expected=%s" % new_expected
+            except pull_service.PullError as exc:
+                _audit(db, run_id, task_id, operator, idempotency_key, "failed", strategy,
+                       {"error": "re-C-FIND failed: %s" % exc.message})
+                return RepullExecutionOutput(success=False, strategy=strategy, task_id=task_id,
+                                             new_status=task.status,
+                                             error="re-C-FIND failed: %s" % exc.message,
+                                             retryable=True)
 
         # 重置为 in_queue + 阶段时间清零。
         task.status = DownloadStatus.IN_QUEUE.value

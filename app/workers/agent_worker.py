@@ -37,6 +37,39 @@ def process_run(run_id: str) -> None:
         series_uid = run.series_instance_uid
         source_id = _source_id_of(run)
         thread_id = run.thread_id or run.run_id
+        study_uids = list(run.study_instance_uid_list or [])
+
+    if study_uids:
+        from app.agent.batch_orchestrator import run_batch
+        try:
+            checkpointer = __import__("app.agent.graph", fromlist=["get_checkpointer"]).get_checkpointer()
+            batch = run_batch(message, study_uids, source_id, run_id, intent=intent,
+                              checkpointer=checkpointer)
+            with session_scope() as db:
+                current = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
+                if current:
+                    current.route = "diagnosis"
+                    current.batch_summary = batch["batch_summary"]
+                    current.study_results = batch["study_results"]
+                    current.diagnosis = {"route": "diagnosis", "batch_summary": batch["batch_summary"]}
+                    current.proposed_action = {
+                        "study_results": batch["study_results"],
+                        "batch_summary": batch["batch_summary"],
+                    } if batch["status"] == "awaiting_approval" else None
+                    current.status = batch["status"]
+                    current.approval_status = "pending" if batch["status"] == "awaiting_approval" else None
+            if batch["status"] != "awaiting_approval":
+                from app.agent import events as ev
+                ev.mark_done(run_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("batch agent run failed: %s", run_id)
+            with session_scope() as db:
+                current = db.query(AgentRun).filter(AgentRun.run_id == run_id).first()
+                if current:
+                    current.status = "failed"
+                    current.error = str(exc)
+            return
 
     # checkpointer 是 HITL 审批 interrupt/replay 的前提（护栏 4）。初始化失败不静默降级——
     # 否则审批闸门失效，直接把 Run 标 failed 并注明（降级不伪装）。
@@ -137,6 +170,17 @@ def process_repull_failure(task_id: str, terminal_status: str, failure_stage: st
         except Exception:  # noqa: BLE001  # SQLite 等不支持行锁的后端直接跳过
             pass
         run = query.first()
+        batch_uid = None
+        if not run:
+            for candidate in (db.query(AgentRun)
+                              .filter(AgentRun.batch_mode.is_(True), AgentRun.status == "awaiting_repull")
+                              .order_by(AgentRun.created_at.desc()).all()):
+                for uid, item in (candidate.study_results or {}).items():
+                    if item.get("task_id") == task_id and item.get("status") == "awaiting_repull":
+                        run, batch_uid = candidate, uid
+                        break
+                if run:
+                    break
         if not run:
             logger.info("repull failure event for task %s has no awaiting_repull run, skip", task_id)
             return
@@ -146,7 +190,59 @@ def process_repull_failure(task_id: str, terminal_status: str, failure_stage: st
         source_id = _source_id_of(run)
         thread_id = run.thread_id or run.run_id
         # 状态先移出 awaiting_repull，防止重复失败消息或并发取消互相覆盖（幂等要求）。
+        if batch_uid:
+            item = dict((run.study_results or {}).get(batch_uid) or {})
+            item["status"] = "running"
+            item["failure_stage"] = failure_stage
+            run.study_results = {**(run.study_results or {}), batch_uid: item}
+            child_thread = item.get("thread_id") or "%s:study:%s" % (run.run_id, batch_uid)
+            run.status = "running"
+            batch_run_id = run.run_id
+            batch_source = _source_id_of(run)
+            batch_thread = child_thread
+            batch_parent = run
+        else:
+            batch_parent = None
         run.status = "running"
+
+    if batch_uid and batch_parent is not None:
+        try:
+            from app.agent.graph import get_checkpointer
+            checkpointer = get_checkpointer()
+            state = run_agent_streaming(
+                message=("已批准执行的批量补拉任务 Study=%s 在 %s 阶段失败，请重新诊断。"
+                         % (batch_uid, failure_stage or "unknown")),
+                study_instance_uid=batch_uid, source_id=batch_source,
+                run_id=batch_run_id, thread_id=batch_thread, intent="diagnosis",
+                checkpointer=checkpointer,
+            )
+            with session_scope() as db:
+                current = db.query(AgentRun).filter(AgentRun.run_id == batch_run_id).first()
+                if current:
+                    results = dict(current.study_results or {})
+                    item = dict(results.get(batch_uid) or {})
+                    item.update({"status": state.get("status", "completed"),
+                                 "task_id": state.get("task_id") or item.get("task_id"),
+                                 "diagnosis": state.get("diagnosis"),
+                                 "repull_plan": state.get("repull_plan"),
+                                 "approval_status": state.get("approval_status")})
+                    results[batch_uid] = item
+                    from app.agent.batch_orchestrator import aggregate_batch
+                    aggregate = aggregate_batch(results, list(results))
+                    current.study_results = aggregate["study_results"]
+                    current.batch_summary = aggregate["batch_summary"]
+                    current.status = aggregate["status"]
+                    current.proposed_action = {"study_results": aggregate["study_results"],
+                                               "batch_summary": aggregate["batch_summary"]}
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("batch study re-diagnosis failed: %s", batch_uid)
+            with session_scope() as db:
+                current = db.query(AgentRun).filter(AgentRun.run_id == batch_run_id).first()
+                if current:
+                    current.status = "partial_failed"
+                    current.error = str(exc)
+            return
         run.proposed_action = None
         run.approval_status = None
         run.operator = None

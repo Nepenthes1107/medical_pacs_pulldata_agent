@@ -13,7 +13,9 @@ logger = logging.getLogger(__name__)
 def _resolve_field(output: Dict, field: str):
     """按点/方括号路径从工具输出里取值，支持 series[C].instance_count、series.C 两种写法。
 
-    取不到返回 (_MISSING, False)。序列按 series_instance_uid 匹配下标或键名。
+    路径解析失败时回退为「叶子字段名深度唯一匹配」：兼容 LLM 对嵌套字段（如
+    tasks[0].expected_count）引用扁平名（expected_count）的情况；仅当该字段名在全输出中
+    恰好出现一次才采用，避免歧义。取不到返回 (None, False)。序列按 series_instance_uid 匹配下标或键名。
     """
     cur = output
     # 归一化 a[b].c → a.b.c
@@ -24,7 +26,7 @@ def _resolve_field(output: Dict, field: str):
             if part in cur:
                 cur = cur[part]
                 continue
-            return None, False
+            return _deep_unique_match(output, parts[-1])
         if isinstance(cur, list):
             # 数字下标
             if part.isdigit() and int(part) < len(cur):
@@ -36,9 +38,36 @@ def _resolve_field(output: Dict, field: str):
             if match is not None:
                 cur = match
                 continue
-            return None, False
-        return None, False
+            return _deep_unique_match(output, parts[-1])
+        return _deep_unique_match(output, parts[-1])
     return cur, True
+
+
+def _deep_unique_match(output: Dict, leaf_name: str):
+    """深度搜索字段名 == leaf_name 的叶子值；恰好一个才返回，否则 (None, False)。
+
+    只收集标量叶子（dict/list 不视为叶子），避免把嵌套结构误当事实值。
+    """
+    matches = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == leaf_name and not isinstance(v, (dict, list)):
+                    matches.append(v)
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(output)
+    if len(matches) == 1:
+        return matches[0], True
+    # 多个匹配但值全部一致（如 series[*].instance_count 都是 20）→ 仍可唯一确定，无歧义。
+    if matches and all(m == matches[0] for m in matches):
+        return matches[0], True
+    return None, False
 
 
 def _values_match(expected, actual) -> bool:

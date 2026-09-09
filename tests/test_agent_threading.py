@@ -46,3 +46,18 @@ def test_redis_checkpointer_uses_configured_ttl(monkeypatch):
         "ttl": {"default_ttl": 90, "refresh_on_read": True},
         "setup": True,
     }
+
+
+def test_chat_request_accepts_and_validates_study_list():
+    from app.core.schemas import ChatRequest
+
+    request = ChatRequest(message="诊断", study_instance_uid_list=[" 1.2.3 ", "1.2.4"])
+    assert request.study_instance_uid_list == ["1.2.3", "1.2.4"]
+
+
+def test_chat_request_rejects_duplicate_study_list():
+    import pytest
+    from app.core.schemas import ChatRequest
+
+    with pytest.raises(ValueError):
+        ChatRequest(message="诊断", study_instance_uid_list=["1.2.3", "1.2.3"])

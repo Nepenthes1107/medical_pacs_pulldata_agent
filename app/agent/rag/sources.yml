@@ -34,14 +34,16 @@ sources:
     type: html
     category: orthanc_doc
     filename: orthanc-dicom-guide.html
-    url: https://orthanc.uclouvain.be/book/dicom-guide.html
+    # 原站 orthanc.uclouvain.be 国内不可达，改走 web.archive.org 缓存（id_ 取原始 HTML）。
+    url: https://web.archive.org/web/2024id_/https://orthanc.uclouvain.be/book/dicom-guide.html
   - id: orthanc-query-retrieve
     title: Configuring DICOM Query Retrieve
     version: current
     type: html
     category: orthanc_doc
     filename: orthanc-query-retrieve.html
-    url: https://orthanc.uclouvain.be/book/faq/query-retrieve.html
+    # 原站 orthanc.uclouvain.be 国内不可达，改走 web.archive.org 缓存（id_ 取原始 HTML）。
+    url: https://web.archive.org/web/2024id_/https://orthanc.uclouvain.be/book/faq/query-retrieve.html
   - id: pynetdicom-query-retrieve-3.0.4
     title: pynetdicom Query Retrieve Service Class
     version: 3.0.4

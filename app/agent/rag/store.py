@@ -29,11 +29,17 @@ class _DashScopeEmbeddingFunction(EmbeddingFunction):
     """
 
     def __call__(self, input: Documents) -> Embeddings:  # noqa: A002 (chroma 接口签名)
-        return get_embeddings().embed_documents(list(input))
+        texts = list(input)
+        emb = get_embeddings()
+        result = []
+        # DashScope text-embedding-v4 单次请求最多 10 条，超限返回 400；按 10 分批兜底。
+        for start in range(0, len(texts), 10):
+            result.extend(emb.embed_documents(texts[start:start + 10]))
+        return result
 
     def embed_query(self, input) -> Embeddings:  # noqa: A002
         texts = [input] if isinstance(input, str) else list(input)
-        return get_embeddings().embed_documents(texts)
+        return self.__call__(texts)
 
     @staticmethod
     def name() -> str:

@@ -155,7 +155,13 @@ def _default_checkpointer():
         "default_ttl": settings.agent.checkpoint_ttl_minutes,
         "refresh_on_read": True,
     }
-    saver = RedisSaver.from_conn_string(settings.redis.url, ttl=ttl)
+    # from_conn_string 返回 context manager（with 退出即关连接），不能长期持有作单例；
+    # 直接构造 RedisSaver 实例（参数一致），进程内长期复用其连接。
+    try:
+        saver = RedisSaver(redis_url=settings.redis.url, ttl=ttl)
+    except TypeError:
+        # Compatibility with older langgraph-checkpoint-redis releases and test doubles.
+        saver = RedisSaver.from_conn_string(settings.redis.url, ttl=ttl)
     saver.setup()
     return saver
 
@@ -198,7 +204,8 @@ def run_agent(
 
 
 def _initial_state(message, task_id, study_instance_uid, series_instance_uid,
-                   source_id, run_id, thread_id, max_iterations, intent) -> AgentState:
+                   source_id, run_id, thread_id, max_iterations, intent,
+                   study_instance_uid_list=None) -> AgentState:
     max_iterations = max_iterations or settings.agent.max_agent_steps
     state: AgentState = {
         "run_id": run_id,
@@ -208,6 +215,7 @@ def _initial_state(message, task_id, study_instance_uid, series_instance_uid,
         "messages": [new_user_message(message)],
         "intent": intent,
         "source_id": source_id,
+        "study_instance_uid_list": list(study_instance_uid_list or []),
         "diagnostic_level": "unknown",
         "iteration": 0,
         "max_iterations": max_iterations,
@@ -239,11 +247,12 @@ def _initial_state(message, task_id, study_instance_uid, series_instance_uid,
     }
     # 仅携带 thread_id 的追问应沿用 checkpoint 中的诊断目标；显式传入任一新目标时，
     # 才整体替换旧目标，防止新 task 与上一轮 Study/Series 混合。
-    if task_id is not None or study_instance_uid is not None or series_instance_uid is not None:
+    if task_id is not None or study_instance_uid is not None or series_instance_uid is not None or study_instance_uid_list:
         state.update({
             "task_id": task_id,
             "study_instance_uid": study_instance_uid,
             "series_instance_uid": series_instance_uid,
+            "study_instance_uid_list": list(study_instance_uid_list or []),
         })
     return state
 
@@ -259,6 +268,8 @@ def run_agent_streaming(
     checkpointer=None,
     max_iterations: Optional[int] = None,
     intent: Optional[str] = None,
+    study_instance_uid_list=None,
+    mark_done: bool = True,
 ) -> dict:
     """流式执行：逐节点拿 state 增量 → 发过程事件 → 聚合出最终 state。
 
@@ -271,7 +282,8 @@ def run_agent_streaming(
     app = build_graph(checkpointer=checkpointer)
     thread_id = thread_id or run_id
     initial = _initial_state(message, task_id, study_instance_uid, series_instance_uid,
-                             source_id, run_id, thread_id, max_iterations, intent)
+                             source_id, run_id, thread_id, max_iterations, intent,
+                             study_instance_uid_list)
     config = {"configurable": {"thread_id": thread_id}}
     degraded = not llm_available()
 
@@ -307,7 +319,7 @@ def run_agent_streaming(
             merged["status"] = "awaiting_approval"
         # awaiting_approval 是 interrupt 暂停，不是终态——mark_done 会让 SSE 提前挂 done，
         # 断掉后续 execute/awaiting_repull 这段用户还要看的过程。真正终态才收尾。
-        if merged.get("status") != "awaiting_approval":
+        if mark_done and merged.get("status") != "awaiting_approval":
             ev.mark_done(run_id)
     return merged
 

@@ -89,8 +89,21 @@ def _complete_awaiting_run(
         pass
     run = query.first()
     if not run:
+        # Batch Run 的 task_id 存在于 study_results 子项，按 task_id 精确回写对应 Study。
+        for candidate in (db.query(AgentRun)
+                          .filter(AgentRun.batch_mode.is_(True), AgentRun.status.in_(("awaiting_repull", "running")))
+                          .order_by(AgentRun.created_at.desc()).all()):
+            for uid, item in (candidate.study_results or {}).items():
+                if item.get("task_id") == task.task_id and item.get("status") == "awaiting_repull":
+                    run = candidate
+                    run._batch_study_uid = uid
+                    break
+            if run:
+                break
+    if not run:
         return None
 
+    batch_uid = getattr(run, "_batch_study_uid", None)
     diagnosis = dict(run.diagnosis or {})
     if outcome == "success":
         diagnosis.update({
@@ -118,9 +131,24 @@ def _complete_awaiting_run(
         })
 
     proposed_action = run.proposed_action
-    run.diagnosis = diagnosis
-    run.status = "completed"
-    return {"run_id": run.run_id, "proposed_action": proposed_action, "outcome": outcome}
+    if batch_uid:
+        results = dict(run.study_results or {})
+        item = dict(results.get(batch_uid) or {})
+        item.update({"status": "completed", "diagnosis": diagnosis,
+                     "integrity_result": outcome, "task_id": task.task_id})
+        results[batch_uid] = item
+        run.study_results = results
+        from app.agent.batch_orchestrator import aggregate_batch
+        aggregate = aggregate_batch(results, list(results))
+        run.batch_summary = aggregate["batch_summary"]
+        run.status = aggregate["status"]
+    else:
+        run.diagnosis = diagnosis
+        run.status = "completed"
+        return {"run_id": run.run_id, "proposed_action": proposed_action, "outcome": outcome,
+                "batch_pending": run.status == "awaiting_repull"}
+    return {"run_id": run.run_id, "proposed_action": proposed_action, "outcome": outcome,
+            "batch_pending": False}
 
 
 def _finish_completed_runs(completed_runs) -> None:
@@ -130,6 +158,8 @@ def _finish_completed_runs(completed_runs) -> None:
     from app.agent import events as ev
 
     for item in completed_runs:
+        if item.get("batch_pending"):
+            continue
         try:
             ev.mark_done(item["run_id"])
         except Exception as exc:  # noqa: BLE001

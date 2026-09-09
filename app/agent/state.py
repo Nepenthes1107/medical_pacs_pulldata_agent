@@ -36,6 +36,7 @@ class AgentState(TypedDict, total=False):
     source_id: str
     diagnostic_level: str  # "study" | "series" | "unknown"
     study_instance_uid: Optional[str]
+    study_instance_uid_list: List[str]
     series_instance_uid: Optional[str]
 
     # ── 循环控制（护栏 5）──

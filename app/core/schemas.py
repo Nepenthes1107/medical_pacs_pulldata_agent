@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.core.enums import DataLevel, DownloadStatus
 
@@ -109,8 +109,23 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     task_id: Optional[str] = None
     study_instance_uid: Optional[str] = None
+    study_instance_uid_list: List[str] = Field(default_factory=list)
     series_instance_uid: Optional[str] = None
     source_id: str = "orthanc-local"
+
+    @model_validator(mode="after")
+    def validate_study_list(self):
+        values = [str(v).strip() for v in self.study_instance_uid_list if str(v).strip()]
+        if len(values) != len(self.study_instance_uid_list):
+            raise ValueError("study_instance_uid_list contains empty UID")
+        if len(set(values)) != len(values):
+            raise ValueError("study_instance_uid_list contains duplicate UID")
+        if len(values) > 20:
+            raise ValueError("study_instance_uid_list supports at most 20 studies")
+        self.study_instance_uid_list = values
+        if self.study_instance_uid and values and self.study_instance_uid not in values:
+            raise ValueError("study_instance_uid must be included in study_instance_uid_list")
+        return self
 
 
 class ChatResponse(BaseModel):
@@ -126,6 +141,8 @@ class RunStatusResponse(BaseModel):
     diagnosis: Optional[Dict[str, Any]] = None
     proposed_action: Optional[Dict[str, Any]] = None
     approval_status: Optional[str] = None
+    batch_summary: Optional[Dict[str, Any]] = None
+    study_results: Optional[Dict[str, Any]] = None
 
 
 class ActionRequest(BaseModel):

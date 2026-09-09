@@ -157,9 +157,12 @@ def _normalize_series_list(request: PullTaskRequest) -> List[Dict]:
 
 def _series_task_items(request_items, pacs_series, level, series_instance_uid):
     request_by_uid = {i.get("series_instance_uid"): i for i in request_items if i.get("series_instance_uid")}
+    # series 级任务的拉取范围：以 request.series_list 显式点名集合为准，一次可定向多个 Series
+    #（多 Series 定向补拉）；未点名时才退回单值 series_instance_uid（兼容单 series 定向语义）。
+    wanted_series = set(request_by_uid) if request_by_uid else ({series_instance_uid} if series_instance_uid else set())
     items = []
     for series in pacs_series:
-        if level == DataLevel.SERIES.value and series.series_instance_uid != series_instance_uid:
+        if level == DataLevel.SERIES.value and series.series_instance_uid not in wanted_series:
             continue
         # sop 级只保留请求里点名的 Series——不能把整个 Study 的 Series 都拉进定向任务。
         if level == DataLevel.SOP.value and series.series_instance_uid not in request_by_uid:
@@ -184,12 +187,16 @@ def _expected_count(request, series_list, study_result, pacs_series, series_inst
         counts = [len(item.get("sop_instance_uid_list") or []) for item in series_list]
         return sum(counts) if any(counts) else None
     if request.level == DataLevel.SERIES:
-        for item in series_list:
-            if item.get("series_instance_uid") == series_instance_uid and item.get("expected_image_number") is not None:
-                return item.get("expected_image_number")
-        for series in pacs_series:
-            if series.series_instance_uid == series_instance_uid:
-                return series.number_of_series_related_instances
+        # series 级任务的期望数 = 各被点名 Series 期望数之和：一次定向多个 Series 时
+        # expected 代表任务覆盖的总量，checker 按此判定完整（与 _recompute_expected 一致）。
+        counts = [item.get("expected_image_number") for item in series_list
+                  if item.get("expected_image_number") is not None]
+        if counts:
+            return sum(counts)
+        if series_instance_uid:
+            for series in pacs_series:
+                if series.series_instance_uid == series_instance_uid:
+                    return series.number_of_series_related_instances
         return None
     if study_result and study_result.number_of_study_related_instances is not None:
         return study_result.number_of_study_related_instances
@@ -319,3 +326,44 @@ def _build_data_id(level: str, study_uid: str, series_uid: Optional[str],
     if level == DataLevel.SERIES.value and series_uid:
         return "series:%s:%s" % (study_uid, series_uid)
     return "study:%s" % study_uid
+
+
+def refresh_task_expected(task: DownloadTask, db: Session) -> Optional[int]:
+    """重新 C-FIND 刷新任务的 expected 与 Study/Series 元数据（retry_task 用）。
+
+    保持同一 task_id、retry_times 连续累加（不新建任务）。成功返回新 expected；
+    PACS 不可达 / Study 查不到等查询失败抛 PullError，调用方据此拒绝重试。
+    """
+    study_result, pacs_series = _load_pacs_metadata(task.source_id, task.study_instance_uid)
+    if study_result:
+        _upsert_study_from_pacs(db, task.source_id, study_result)
+    if pacs_series:
+        _upsert_series_from_pacs(db, task.source_id, pacs_series)
+    expected = _recompute_expected(task, study_result, pacs_series)
+    task.expected_image_number = expected
+    return expected
+
+
+def _recompute_expected(task: DownloadTask, study_result: Optional[StudyResult],
+                        pacs_series: List[SeriesResult]) -> Optional[int]:
+    """按任务自身 level/范围，用最新 C-FIND 结果重算 expected（不动 request 结构）。"""
+    level = DataLevel(task.level)
+    if level == DataLevel.SOP:
+        # sop 级期望数只由点名 SOP 数量决定，不随 C-FIND 变。
+        counts = [len(i.get("sop_instance_uid_list") or [])
+                  for i in ((task.task_body or {}).get("series_list") or [])]
+        return sum(counts) or None
+    if level == DataLevel.SERIES:
+        targets = (task.task_body or {}).get("series_list") or []
+        if not targets and task.series_instance_uid:
+            targets = [{"series_instance_uid": task.series_instance_uid}]
+        total = 0
+        for item in targets:
+            series_uid = item.get("series_instance_uid")
+            match = next((s for s in pacs_series if s.series_instance_uid == series_uid), None)
+            if not match or match.number_of_series_related_instances is None:
+                return None
+            total += match.number_of_series_related_instances
+        return total or None
+    # study 级：Study 总数。
+    return study_result.number_of_study_related_instances if study_result else None

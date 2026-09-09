@@ -92,6 +92,9 @@ def parse_with_llm(message: str, context: str = "") -> Optional[Dict]:
         value = getattr(decision, field, None)
         if value and value in message:
             patch[field] = value
+    listed = [uid for uid in decision.study_instance_uid_list if uid and uid in message]
+    if len(listed) >= 2:
+        patch["study_instance_uid_list"] = list(dict.fromkeys(listed))
 
     # 判为诊断却没抽到任何可定位标识 → 转澄清，避免下游空跑 DB。
     if not any(k in patch for k in ("task_id", "study_instance_uid", "series_instance_uid")):
@@ -126,7 +129,8 @@ def _classify_request(state: AgentState) -> Dict:
     """
     message = state.get("message", "") or ""
     intent = (state.get("intent") or "").strip().lower()
-    explicit = state.get("task_id") or state.get("study_instance_uid") or state.get("series_instance_uid")
+    explicit = (state.get("task_id") or state.get("study_instance_uid") or
+                state.get("study_instance_uid_list") or state.get("series_instance_uid"))
 
     # 1) 显式意图字段最高优先。first_pull 要求有拉取目标（study/series）。
     if intent == "first_pull":
@@ -146,7 +150,9 @@ def _classify_request(state: AgentState) -> Dict:
     # 规则解析：文本里能抽到 task_id(UUID) 或 UID。
     task_id = _extract(_UUID_RE, message)
     study_uid = None
-    uid = _extract(_UID_RE, message)
+    uids = _UID_RE.findall(message or "")
+    uid = uids[0] if uids else None
+    study_uid_list = list(dict.fromkeys(uids)) if len(set(uids)) >= 2 else []
     if uid:
         study_uid = uid  # 无法仅凭正则区分 study/series，交给 resolve_target/首拉节点结合 DB 判定
     if task_id or uid:
@@ -157,6 +163,8 @@ def _classify_request(state: AgentState) -> Dict:
             patch["task_id"] = task_id
         if study_uid:
             patch["study_instance_uid"] = study_uid
+        if study_uid_list:
+            patch["study_instance_uid_list"] = study_uid_list
         return patch
 
     # 知识问答意图（规则命中）。

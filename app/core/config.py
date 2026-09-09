@@ -105,6 +105,9 @@ class AgentConfig(BaseModel):
     # 紧急止损标记存活时长：必须长于 PACS 把一批 C-STORE 推完的时间，否则标记先过期、
     # 余下影像照常收下。1 小时覆盖大范围 Study 的推送窗口。
     abort_flag_ttl_seconds: int = 3600
+    batch_max_studies: int = 20
+    batch_concurrency: int = 4
+    batch_transient_retries: int = 2
 
 
 class LangSmithConfig(BaseModel):

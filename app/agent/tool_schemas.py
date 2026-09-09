@@ -195,6 +195,7 @@ class ReceiveStatusInput(BaseToolInput):
 
 
 class ReceiveStatusOutput(BaseToolOutput):
+    storescp_reachable: bool = False  # storescp 端口当前是否可连（接收端存活探测）
     storescp_received_count: int = 0  # storescp_image 登记记录数（非唯一 SOP，仅活动信号）
     local_parsed_count: int = 0  # 成功解析的本地 DICOM 文件数
     local_unique_sop_count: int = 0  # 本地唯一 SOP 数，唯一权威计数
@@ -324,6 +325,7 @@ class RouteDecision(BaseModel):
     route: str  # "diagnosis" | "knowledge_qa" | "clarification"
     task_id: Optional[str] = None
     study_instance_uid: Optional[str] = None
+    study_instance_uid_list: List[str] = Field(default_factory=list)
     series_instance_uid: Optional[str] = None
     clarification: Optional[str] = None  # route=clarification 时给用户的追问语
 

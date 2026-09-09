@@ -292,6 +292,20 @@ curl -X POST http://localhost:8000/agent/chat \
   -d '{"message":"诊断这个补拉任务","task_id":"替换为任务 UUID"}'
 ```
 
+批量诊断多个 Study（单次最多 20 个，默认并发 4）：
+
+```bash
+curl -X POST http://localhost:8000/agent/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message":"诊断这些 Study 是否缺失并生成补拉计划",
+    "study_instance_uid_list":["1.20251203000331","1.20251203000332"],
+    "source_id":"orthanc-local"
+  }'
+```
+
+批量 Run 的 `run_id` 是整个批次的执行标识；每个 Study 的下载任务仍有独立 `task_id`。查询同一个 Run 时，响应中的 `batch_summary` 和 `study_results` 分别提供聚合统计与 Study 明细。
+
 后续对话复用响应中的 `thread_id`，Redis Checkpointer 会恢复对应 State：
 
 ```bash

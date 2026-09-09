@@ -56,7 +56,7 @@ def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
     查-建之间用 Redis 短锁防并发同 thread 各建一个（复用 execute_repull_plan 的锁思路）。
     """
     if not request.message and not (
-        request.task_id or request.study_instance_uid or request.series_instance_uid
+        request.task_id or request.study_instance_uid or request.study_instance_uid_list or request.series_instance_uid
     ):
         raise HTTPException(status_code=400, detail="message is required")
 
@@ -85,6 +85,8 @@ def agent_chat(request: ChatRequest, db: Session = Depends(get_db)):
             thread_id=thread_id, user_id=request.user_id, source_id=request.source_id,
             task_id=request.task_id, study_instance_uid=request.study_instance_uid,
             series_instance_uid=request.series_instance_uid,
+            study_instance_uid_list=request.study_instance_uid_list or None,
+            batch_mode=bool(request.study_instance_uid_list),
         )
         db.add(run)
         db.commit()
@@ -142,7 +144,7 @@ def _release_thread_lock(thread_id: str, token: str) -> None:
 
 # 终态集：SSE 据此结束推送。含 cancelled/aborted/rejected——这些状态下 worker 不会再发
 # done 事件，若不算终态，SSE 连接会一直挂着等一个永不到来的事件。
-_SSE_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "aborted", "rejected"}
+_SSE_TERMINAL_STATUSES = {"completed", "partial_failed", "failed", "cancelled", "aborted", "rejected"}
 _SSE_POLL_INTERVAL = 0.5
 _SSE_HEARTBEAT_INTERVAL = 15
 
@@ -210,6 +212,8 @@ def get_run(run_id: str, db: Session = Depends(get_db)):
     resp = RunStatusResponse(
         run_id=run.run_id, status=run.status, route=run.route,
         approval_status=run.approval_status,
+        batch_summary=run.batch_summary,
+        study_results=run.study_results,
     )
     # running 可暂不返回诊断；其余状态（含 awaiting_approval）返回已生成结果。
     if run.status != "running":
@@ -227,6 +231,26 @@ def run_action(run_id: str, request: ActionRequest, db: Session = Depends(get_db
     action = request.action.lower()
     if action not in ("approve", "reject"):
         raise HTTPException(status_code=400, detail="action must be approve or reject")
+
+    if run.batch_mode:
+        try:
+            from app.agent.batch_orchestrator import resume_batch_after_approval
+            batch = resume_batch_after_approval(
+                run_id, {"study_results": run.study_results or {}}, action, request.operator
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("batch approval failed: %s", run_id)
+            run.status = "failed"
+            run.error = str(exc)
+            db.commit()
+            raise HTTPException(status_code=500, detail="batch approval failed: %s" % exc)
+        run.study_results = batch["study_results"]
+        run.batch_summary = batch["batch_summary"]
+        run.approval_status = "approved" if action == "approve" else "rejected"
+        run.operator = request.operator
+        run.status = "rejected" if action == "reject" else batch["status"]
+        db.commit()
+        return ActionResponse(run_id=run_id, status=run.status)
 
     # 审批 = 从图的 human_approval 暂停处 Command(resume) 恢复。
     # approve → 图内 execute 节点执行写操作；reject → 图内直接收尾。写操作只发生在图内固定节点。
@@ -284,6 +308,39 @@ def abort_run(run_id: str, request: AbortRequest = AbortRequest(), db: Session =
     """
     run = _get_run_or_404(db, run_id)
     task_id = run.task_id
+    if run.batch_mode:
+        task_ids = [item.get("task_id") for item in (run.study_results or {}).values()
+                    if item.get("task_id")]
+        if not task_ids:
+            raise HTTPException(status_code=409,
+                                detail="batch run has no download task to abort (status=%s)" % run.status)
+        flag_set = True
+        total_received = 0
+        may_still_arrive = False
+        for child_task_id in task_ids:
+            series_uids, previous_status = _abort_scope(db, child_task_id)
+            child = db.query(DownloadTask).filter(DownloadTask.task_id == child_task_id).first()
+            child_flag = abort_service.mark_aborted(child_task_id,
+                                                     child.study_instance_uid if child else None,
+                                                     series_uids)
+            flag_set = flag_set and child_flag
+            if child and child.status not in (DownloadStatus.SUCCESS.value,
+                                              DownloadStatus.FAIL.value,
+                                              DownloadStatus.UNVERIFIED.value,
+                                              DownloadStatus.CANCEL.value):
+                child.status = DownloadStatus.CANCEL.value
+                child.last_error = "aborted by operator"
+                child.checked_at = datetime.utcnow()
+                child.failed_at = datetime.utcnow()
+            total_received += _received_count(child.study_instance_uid if child else None, series_uids)
+            may_still_arrive = may_still_arrive or previous_status == DownloadStatus.DOWNLOADING.value
+        run.status = "aborted"
+        run.operator = request.operator if request else None
+        db.commit()
+        return AbortResponse(run_id=run_id, status="aborted", task_id=None,
+                             flag_set=flag_set, already_received=total_received,
+                             may_still_arrive=may_still_arrive,
+                             note=None if flag_set else "部分 Study 的止损标记写入失败")
     if not task_id:
         raise HTTPException(status_code=409,
                             detail="run has no download task to abort (status=%s)" % run.status)

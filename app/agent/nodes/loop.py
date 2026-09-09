@@ -283,10 +283,16 @@ def act(state: AgentState) -> Dict:
     from app.core.config import settings
 
     calls = _protocol_tool_calls(state.get("pending_tool_calls", []) or [])
-    if state.get("use_rag") is not True:
-        for call in calls:
-            if call.get("name") == "search_knowledge":
-                raise RuntimeError("search_knowledge requires knowledge_qa intent")
+    # 诊断/首拉/澄清意图下禁止 search_knowledge（RAG 仅 knowledge_qa 可用）：
+    # 不抛异常让整张图崩溃，而是收敛为 tool_not_allowed 结构化拒绝，
+    # 让 ReAct 收到「该工具不可用」后改用其它只读工具继续采证。
+    rag_gated = state.get("use_rag") is not True
+
+    def _run(call: Dict) -> Dict:
+        if rag_gated and call.get("name") == "search_knowledge":
+            return _rejected("search_knowledge requires knowledge_qa intent",
+                             "tool_not_allowed", "诊断阶段请改用其它只读工具采证，勿调用知识库检索")
+        return _run_tool_call(call)
     tool_results = dict(state.get("tool_results", {}))
     history = list(state.get("tool_call_history", []))
     new_evidence: List[Dict] = []
@@ -298,11 +304,11 @@ def act(state: AgentState) -> Dict:
 
     # 工具执行并发化：单调用直接跑，避免线程池开销；多调用走线程池。结果按索引回填保序。
     if len(calls) <= 1:
-        outputs = [_run_tool_call(call) for call in calls]
+        outputs = [_run(call) for call in calls]
     else:
         workers = min(len(calls), max(1, settings.agent.act_max_workers))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            outputs = list(pool.map(_run_tool_call, calls))
+            outputs = list(pool.map(_run, calls))
 
     tool_messages = []
     for call, out in zip(calls, outputs):
