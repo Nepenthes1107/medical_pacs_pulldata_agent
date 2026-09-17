@@ -2,28 +2,27 @@
 import json
 import os
 import time
-from typing import Dict, List, Optional
 
-from app.agent.rag.pipeline import (
+from src.core.settings import settings
+from src.infrastructure.rag_pipeline import (
     _bm25_retrieve,
     _dense_retrieve,
     _rerank,
     _rrf_fuse,
 )
-from app.core.config import settings
 
 EVAL_SET_PATH = os.path.join(os.path.dirname(__file__), "eval_set.json")
 STAGES = ("bm25", "dense", "rrf", "rrf_rerank")
 
 
-def load_eval_set() -> List[Dict]:
+def load_eval_set() -> list[dict]:
     if not os.path.exists(EVAL_SET_PATH):
         return []
-    with open(EVAL_SET_PATH, "r", encoding="utf-8") as fp:
+    with open(EVAL_SET_PATH, encoding="utf-8") as fp:
         return json.load(fp)
 
 
-def _retrieve_stage(query: str, category: Optional[str], stage: str) -> List[Dict]:
+def _retrieve_stage(query: str, category: str | None, stage: str) -> list[dict]:
     candidate_k = settings.rag.candidate_k
     if stage == "bm25":
         return _bm25_retrieve(query, category, candidate_k)[:5]
@@ -37,7 +36,7 @@ def _retrieve_stage(query: str, category: Optional[str], stage: str) -> List[Dic
     return _rerank(query, fused, 5)
 
 
-def _is_relevant(item: Dict, relevant: Dict) -> bool:
+def _is_relevant(item: dict, relevant: dict) -> bool:
     metadata = item.get("metadata") or {}
     return (
         item.get("id") in set(relevant.get("ids", []))
@@ -45,7 +44,7 @@ def _is_relevant(item: Dict, relevant: Dict) -> bool:
     )
 
 
-def evaluate(stage: str) -> Dict:
+def evaluate(stage: str) -> dict:
     if stage not in STAGES:
         raise ValueError("unknown stage: %s" % stage)
     cases = load_eval_set()
@@ -75,7 +74,7 @@ def evaluate(stage: str) -> Dict:
     }
 
 
-def compare() -> Dict:
+def compare() -> dict:
     return {stage: evaluate(stage) for stage in STAGES}
 
 
