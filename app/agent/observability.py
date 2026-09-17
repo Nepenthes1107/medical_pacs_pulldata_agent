@@ -6,9 +6,8 @@ LangSmith 仅作可观测层，不在关键路径：不可用不影响主流程�
 """
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List
 
-from app.core.config import settings
+from src.core.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +23,8 @@ class RunMetrics:
     run_id: str = "adhoc"
     llm_calls: int = 0
     total_tokens: int = 0
-    node_latency_ms: Dict[str, float] = field(default_factory=dict)
-    tool_calls: List[str] = field(default_factory=list)
+    node_latency_ms: dict[str, float] = field(default_factory=dict)
+    tool_calls: list[str] = field(default_factory=list)
 
     def record_node(self, name: str, latency_ms: float) -> None:
         self.node_latency_ms[name] = round(latency_ms, 2)
@@ -37,7 +36,7 @@ class RunMetrics:
     def record_tool(self, name: str) -> None:
         self.tool_calls.append(name)
 
-    def summary(self) -> Dict:
+    def summary(self) -> dict:
         return {
             "run_id": self.run_id,
             "llm_calls": self.llm_calls,
