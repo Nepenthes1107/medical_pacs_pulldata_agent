@@ -1,4 +1,5 @@
-from app.agent import graph
+# 实现已迁至 src.agents.pacs（app.agent.graph 为兼容 facade，不 re-export 下划线私有 helper）
+from src.agents.pacs import graph
 
 
 def test_initial_state_uses_thread_id_and_appends_user_message():
@@ -57,6 +58,7 @@ def test_chat_request_accepts_and_validates_study_list():
 
 def test_chat_request_rejects_duplicate_study_list():
     import pytest
+
     from app.core.schemas import ChatRequest
 
     with pytest.raises(ValueError):

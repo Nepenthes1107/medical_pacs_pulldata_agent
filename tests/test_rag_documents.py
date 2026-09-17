@@ -2,10 +2,7 @@ import json
 
 import pytest
 
-from app.agent.rag import documents
-from app.agent.rag import init_knowledge
-from app.agent.rag import lexical
-from app.agent.rag import store
+from app.agent.rag import documents, init_knowledge, lexical, store
 
 
 def test_pdf_docx_html_and_json_parsers_keep_structure(tmp_path):

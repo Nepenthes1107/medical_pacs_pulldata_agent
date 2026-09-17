@@ -3,7 +3,6 @@ import pytest
 from app.agent.harness import build_citation_facts, verify_citations
 from app.agent.nodes import loop
 
-
 TOOL_ID = "11111111-1111-1111-1111-111111111111"
 
 

@@ -9,7 +9,6 @@ from app.agent.nodes import loop
 from app.agent.tool_schemas import BaseToolOutput, ComputeIntegrityOutput
 from app.agent.tools import TOOL_REGISTRY
 
-
 # --- 注册表白名单 ---------------------------------------------------------
 
 def test_unknown_tool_is_rejected_without_execution():
