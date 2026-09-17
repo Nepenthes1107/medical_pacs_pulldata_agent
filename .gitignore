@@ -5,6 +5,7 @@ __pycache__/
 
 # --- 虚拟环境 ---
 .venv/
+.venv*/
 venv/
 
 # --- 运行时数据 ---
@@ -44,6 +45,7 @@ build/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+.uv-cache/
 
 # --- 日志（本机/容器调试重定向） ---
 logs/
