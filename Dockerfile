@@ -19,13 +19,14 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc default-libmysqlclient-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
-
+COPY pyproject.toml ./pyproject.toml
 COPY app ./app
+COPY src ./src
+RUN pip install --no-cache-dir ".[pacs,rag,mcp]" -i https://mirrors.aliyun.com/pypi/simple/
+
 COPY config ./config
 RUN mkdir -p /app/data/fileserver /app/data/dicom_samples
 
 EXPOSE 8000 8001 11112
 
-CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "src.run_service"]

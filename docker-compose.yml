@@ -50,7 +50,7 @@ services:
 
   pull-data-api:
     build: .
-    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    command: python -m src.run_service
     environment:
       DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
       REDIS_URL: redis://redis:6379/0
@@ -95,7 +95,7 @@ services:
 
   pull-data-worker:
     build: .
-    command: python -m app.workers.downloader_worker
+    command: python -m src.workers.downloader
     environment:
       DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
       REDIS_URL: redis://redis:6379/0
@@ -116,7 +116,7 @@ services:
 
   pull-data-checker:
     build: .
-    command: python -m app.workers.checker_worker
+    command: python -m src.workers.checker
     environment:
       DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
       REDIS_URL: redis://redis:6379/0
@@ -133,7 +133,7 @@ services:
 
   agent-worker:
     build: .
-    command: python -m app.workers.agent_worker
+    command: python -m src.workers.agent
     environment:
       DATABASE_URL: mysql+pymysql://uii:011107@mysql:3306/pulldata
       REDIS_URL: redis://redis:6379/0
@@ -159,7 +159,7 @@ services:
 
   rag-init:
     build: .
-    command: python -m app.agent.rag.init_knowledge --download
+    command: python -m src.infrastructure.rag_index --download
     environment:
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       FILESERVER_ROOT: /app/data/fileserver
