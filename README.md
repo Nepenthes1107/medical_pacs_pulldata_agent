@@ -137,6 +137,19 @@ docker compose up --build -d pull-data-api pull-data-storescp pull-data-worker p
 curl http://localhost:8000/health
 ```
 
+Agent 平台入口：
+
+```bash
+curl http://localhost:8000/agents/info
+curl -X POST http://localhost:8000/agents/pacs-diagnostician/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"检查任务状态","thread_id":"demo-thread"}'
+```
+
+PACS Run 业务命令统一使用 `/pacs/runs/*`：创建 Run 使用 `POST /pacs/runs`，审批使用
+`POST /pacs/runs/{run_id}/approval`，止损和取消分别使用 `/abort`、`/cancel`。旧
+`/agent/*` 路由默认关闭；迁移期间如需临时启用，设置 `LEGACY_AGENT_API_ENABLED=true`。
+
 ## 导入测试 DICOM 到 Orthanc
 
 导入前 10 个测试 series（约 2100 个实例）：
@@ -283,6 +296,19 @@ LIMIT 10;
 ```
 
 ## Agent 诊断
+
+平台 Agent Service 的新入口是 `/agents/*`；旧 `/agent/*` 仅在
+`LEGACY_AGENT_API_ENABLED=true` 时启用，迁移期用于兼容旧客户端。
+
+```bash
+curl http://localhost:8000/agents/info
+curl -X POST http://localhost:8000/agents/pacs-diagnostician/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"检查任务状态","thread_id":"demo-thread"}'
+```
+
+PACS 业务命令使用 `/pacs/runs/*`，通用消息流使用 `/agents/{agent_id}/stream`。
+审批只能通过 `/pacs/runs/{run_id}/approval` 进入固定的人工闸门。
 
 创建异步诊断 Run；响应同时返回 `run_id` 和 `thread_id`：
 
